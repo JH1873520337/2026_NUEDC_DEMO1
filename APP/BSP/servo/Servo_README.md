@@ -1,20 +1,46 @@
-# 双轴舵机云台驱动
+﻿# Servo 舵机驱动
 
-该驱动基于 STM32 HAL 和 TIM1 PWM，支持云台水平轴、俯仰轴的直接控制和平滑控制。
+## 硬件参数
 
-## 硬件配置
+| 项目 | 配置 |
+|---|---|
+| 舵机型号 | DS3115 |
+| PWM 定时器 | TIM1 |
+| Yaw 舵机 | TIM1_CH3，PE13 |
+| Pitch 舵机 | TIM1_CH4，PE14 |
+| PWM 频率 | 50 Hz |
+| TIM1 输入时钟 | 162 MHz |
+| PSC | 179 |
+| 计数频率 | 900 kHz |
+| ARR | 17999 |
+| 脉宽 | 500~2500 us |
+| 机械角度 | 0~180° |
+| 软件分辨率 | 0.1° |
 
-| 云台轴 | 引脚 | 定时器通道 | 驱动编号 |
-| --- | --- | --- | --- |
-| 水平轴 Pan | PE13 | TIM1_CH3 | `SERVO_PAN` |
-| 俯仰轴 Tilt | PE14 | TIM1_CH4 | `SERVO_TILT` |
+由于计数器周期为 `1 / 900 kHz = 1.111... us`，500 us 和 2500 us 分别对应比较值 450 和 2250。整个角度范围共有 1800 个比较值，正好对应 0.1° 分辨率。
 
-TIM1 使用 1 MHz 计数频率和 20000 计数周期，对应 50 Hz PWM。默认角度范围为
-0~180 度，脉宽范围为 500~2500 us，上电初始化到 90 度中位。
+> 如果以后修改系统时钟、PSC 或 ARR，必须同步修改 `Servo.h` 中的 `SERVO_TIMER_COUNTER_HZ`，否则脉宽换算会错误。
+
+## 滤波流程
+
+每次调用 `Servo_Update()` 时，角度指令依次经过：
+
+1. 一阶低通滤波；
+2. 一维卡尔曼滤波；
+3. 0.1° 量化；
+4. 写入 TIM1 CCR3/CCR4。
+
+默认一阶滤波系数和卡尔曼参数位于 `Servo.h`：
+
+```c
+SERVO_FIRST_ORDER_ALPHA
+SERVO_KALMAN_PROCESS_NOISE
+SERVO_KALMAN_MEASUREMENT_NOISE
+```
 
 ## 初始化
 
-`main.c` 中先执行 `MX_TIM1_Init()`，然后在任务中初始化舵机：
+必须先完成 `MX_TIM1_Init()`，再调用：
 
 ```c
 if (Servo_Init() != HAL_OK) {
@@ -22,54 +48,35 @@ if (Servo_Init() != HAL_OK) {
 }
 ```
 
-## 直接控制
+初始化后两个舵机均输出 90°。`Servo_Init()` 是 PWM 启动兼容的：即使 `main.c` 已经调用过 `HAL_TIM_PWM_Start()`，也不会重复启动该通道。
+
+## 使用示例
 
 ```c
-Servo_SetAngle_Direct(SERVO_PAN, 60.0f);
-Servo_SetAngle_Direct(SERVO_TILT, 120.0f);
+Servo_Init();
+Servo_SetAngle(SERVO_YAW, 120.3f);
+Servo_SetAngle(SERVO_PITCH, 65.0f);
 
-/* 同时设置两个轴 */
-Servo_SetGimbalAngle_Direct(90.0f, 90.0f);
-```
-
-所有角度在写入 PWM 前都会自动限制到配置范围内。不同型号舵机的安全角度和脉宽可以在
-`Servo_Config` 中分别调整。
-
-## 平滑控制
-
-```c
-Servo_SetGimbalAngle_Smooth(45.0f, 120.0f, 60.0f, 120.0f);
-
+/* 建议由 10 ms 周期任务持续调用 */
 for (;;) {
-    Servo_Loop_Process();
+    Servo_Update();
     osDelay(10);
 }
 ```
 
-`max_speed` 单位为度/秒，`accel` 单位为度/秒平方。平滑运动期间必须以较稳定的周期调用
-`Servo_Loop_Process()`。
+`Servo_SetAngle()` 只更新目标值，不阻塞等待舵机完成运动。只有持续调用 `Servo_Update()`，滤波后的 PWM 才会逐步到达目标。
 
-## 测试任务
-
-`Task/servo_test.c` 会先等待 2 秒，然后依次测试水平轴、俯仰轴和双轴联动，运动范围限制在
-45~135 度，结束后回到 90 度。当前 `StartDefaultTask()` 已调用 `servo_test_run()`。
-
-恢复底盘测试时，将 `../../../Core/Src/freertos.c` 中的：
+## 立即停止
 
 ```c
-servo_test_run();
+Servo_Stop(SERVO_YAW);
+Servo_StopAll();
 ```
 
-改回：
+停止函数会立即把目标、低通状态和卡尔曼状态锁定到当前 PWM 指令角度，不关闭 PWM，因此舵机会保持当前位置。
 
-```c
-chassis_test_run();
-```
+## 注意事项
 
-并同步将头文件 `servo_test.h` 改回 `chassis_test.h`。
-
-## 接线注意
-
-- 舵机建议使用独立 5 V 电源，STM32 与舵机电源必须共地。
-- 首次上电不要安装负载，确认两个轴的实际方向和机械行程后再调整角度范围。
-- 某些舵机只允许 1000~2000 us，出现撞限位或抖动时应先缩小脉宽范围。
+- DS3115 必须使用独立、足够电流的电源，舵机电源地与 MCU 地必须共地。
+- 本驱动没有位置反馈，`current_angle_deg` 表示当前输出给舵机的 PWM 软件角度，并非编码器实测角度。
+- 公共接口默认在任务上下文调用；若多个任务同时控制舵机，需要在上层增加互斥保护。

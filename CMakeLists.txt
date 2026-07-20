@@ -45,13 +45,17 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
-    app/BSP/servo/Servo.c
+    APP/Algorithm/KalmanFilter.c
+    APP/BSP/servo/Servo.c
+    APP/Serves/gimbal/Gimbal.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
-    app/BSP/servo
+    APP/Algorithm
+    APP/BSP/servo
+    APP/Serves/gimbal
 )
 
 # Add project symbols (macros)
