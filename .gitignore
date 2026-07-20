@@ -1,0 +1,43 @@
+# CMake build directories and generated files
+/build/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+build.ninja
+.ninja_*
+compile_commands.json
+CMakeUserPresets.json
+
+# Compiler and linker outputs
+*.o
+*.obj
+*.d
+*.a
+*.lib
+*.elf
+*.axf
+*.hex
+*.bin
+*.map
+*.lst
+*.su
+
+# IDE and editor metadata
+/.idea/
+/.vscode/
+/.settings/
+/.project
+/.cproject
+/.mxproject
+*.launch
+*.code-workspace
+
+# OS and temporary files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
