@@ -30,11 +30,11 @@ if (Gimbal_Init() != GIMBAL_STATUS_OK) {
 ```c
 for (;;) {
     Gimbal_Update();
-    osDelay(10);
+    osDelay(5);
 }
 ```
 
-建议以固定的 10 ms 周期调用。每次更新使用同一个缩放系数计算两轴步进，因此保持二维运动方向，同时保证任意一个舵机单次指令变化均不超过 2°。`Gimbal_Update()` 已在内部调用 `Servo_Update()`，使用云台层时不要在同一周期再次调用 `Servo_Update()`。
+当前工程由 `freertos.c` 中的 `gimbal_update` 任务每 5 ms 调用一次。每次更新使用同一个缩放系数计算两轴步进，因此保持二维运动方向，同时保证任意一个舵机单次指令变化均不超过 2°。`Gimbal_Update()` 已在内部调用 `Servo_Update()`，使用云台层时不要在同一周期再次调用 `Servo_Update()`。
 
 ## 绝对位置控制
 
@@ -71,6 +71,22 @@ Gimbal_Stop();
 ```
 
 停止函数会立即把两轴目标锁定为当前 PWM 软件角度，并继续输出 PWM 以保持当前位置。由于系统没有舵机位置反馈，结构体中的当前位置是当前发送给舵机的角度，不是编码器实测角度。
+
+## 暂停、继续与复位续行
+
+```c
+Gimbal_Pause();
+Gimbal_Start();
+Gimbal_ResetToOrigin();
+```
+
+- `Gimbal_Pause()` 保存当前最终目标并保持当前位置，等待启动。
+- `Gimbal_Start()` 从暂停位置继续执行保存的最终目标。
+- `Gimbal_ResetToOrigin()` 保存当前最终目标，运动到云台原点 `(0,0)` 后保持等待。
+- 原点等待时调用 `Gimbal_Start()` 才会继续复位前的原目标。
+- 复位途中也可以暂停；第一次启动先继续回原点，到达后再次等待启动。
+- `Gimbal_Resume()` 保留为 `Gimbal_Start()` 的兼容别名。
+- 新的绝对、相对、向量命令以及 `Gimbal_Stop()` 会取消尚未完成的暂停或复位恢复上下文。
 
 ## 状态读取
 

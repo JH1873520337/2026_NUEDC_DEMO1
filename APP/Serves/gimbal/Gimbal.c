@@ -22,6 +22,17 @@
 /** 云台单实例状态。所有公共接口默认由同一个 RTOS 任务串行调用。 */
 static Gimbal_State_t g_gimbal_state;
 
+typedef struct
+{
+    float target_yaw_deg;
+    float target_pitch_deg;
+    Gimbal_ControlMode_t mode;
+    uint8_t valid;
+} Gimbal_SavedMotion_t;
+
+static Gimbal_SavedMotion_t g_pause_motion;
+static Gimbal_SavedMotion_t g_reset_motion;
+
 /** 不依赖 libm 的浮点绝对值函数。 */
 static float Gimbal_Abs(float value)
 {
@@ -118,6 +129,24 @@ static uint8_t Gimbal_TargetArrived(void)
                : 0U;
 }
 
+static void Gimbal_ClearSavedMotion(Gimbal_SavedMotion_t *motion)
+{
+    motion->target_yaw_deg = GIMBAL_CENTER_ANGLE_DEG;
+    motion->target_pitch_deg = GIMBAL_CENTER_ANGLE_DEG;
+    motion->mode = GIMBAL_MODE_STOPPED;
+    motion->valid = 0U;
+}
+
+static void Gimbal_CancelTemporaryMotion(void)
+{
+    Gimbal_ClearSavedMotion(&g_pause_motion);
+    Gimbal_ClearSavedMotion(&g_reset_motion);
+    g_gimbal_state.paused = 0U;
+    g_gimbal_state.reset_in_progress = 0U;
+    g_gimbal_state.resume_pending = 0U;
+    g_gimbal_state.waiting_start = 0U;
+}
+
 /**
  * 统一建立一次新的最终目标。
  *
@@ -165,6 +194,15 @@ static void Gimbal_FinishMotion(void)
     Servo_StopAll();
 }
 
+static void Gimbal_HoldAtOrigin(void)
+{
+    Gimbal_FinishMotion();
+    g_gimbal_state.mode = GIMBAL_MODE_ORIGIN_WAITING;
+    g_gimbal_state.reset_in_progress = 1U;
+    g_gimbal_state.resume_pending = (g_reset_motion.valid != 0U) ? 1U : 0U;
+    g_gimbal_state.waiting_start = 1U;
+}
+
 Gimbal_Status_t Gimbal_Init(void)
 {
     /* Servo_Init() 会写入 90° 比较值并启动 TIM1_CH3/CH4。 */
@@ -188,6 +226,12 @@ Gimbal_Status_t Gimbal_Init(void)
     g_gimbal_state.moving = 0U;
     g_gimbal_state.limit_reached = 0U;
     g_gimbal_state.driver_fault = 0U;
+    g_gimbal_state.paused = 0U;
+    g_gimbal_state.reset_in_progress = 0U;
+    g_gimbal_state.resume_pending = 0U;
+    g_gimbal_state.waiting_start = 0U;
+    Gimbal_ClearSavedMotion(&g_pause_motion);
+    Gimbal_ClearSavedMotion(&g_reset_motion);
 
     return GIMBAL_STATUS_OK;
 }
@@ -203,6 +247,7 @@ Gimbal_Status_t Gimbal_SetAbsolute(float yaw_deg, float pitch_deg)
     }
 
     /* 新命令以 Servo 当前软件输出为运动起点，而不是旧的中间指令。 */
+    Gimbal_CancelTemporaryMotion();
     Gimbal_SyncCurrentFromServo();
     g_gimbal_state.vector_x = 0.0f;
     g_gimbal_state.vector_y = 0.0f;
@@ -223,6 +268,7 @@ Gimbal_Status_t Gimbal_SetRelative(float delta_yaw_deg,
     }
 
     /* 相对控制严格以调用瞬间的位置为零点，随后统一进行 ±90° 限幅。 */
+    Gimbal_CancelTemporaryMotion();
     Gimbal_SyncCurrentFromServo();
     g_gimbal_state.vector_x = 0.0f;
     g_gimbal_state.vector_y = 0.0f;
@@ -250,6 +296,8 @@ Gimbal_Status_t Gimbal_SetVector(float x, float y)
     if ((Gimbal_IsFinite(x) == 0U) || (Gimbal_IsFinite(y) == 0U)) {
         return GIMBAL_STATUS_INVALID_ARGUMENT;
     }
+
+    Gimbal_CancelTemporaryMotion();
 
     /*
      * 使用无穷范数 max(|X|,|Y|) 归一化，既保持 X:Y 比例，也使两个方向
@@ -333,7 +381,12 @@ void Gimbal_Update(void)
     Gimbal_SyncCurrentFromServo();
 
     if (Gimbal_TargetArrived() != 0U) {
-        Gimbal_FinishMotion();
+        if (g_gimbal_state.reset_in_progress != 0U &&
+            g_gimbal_state.mode == GIMBAL_MODE_RESETTING) {
+            Gimbal_HoldAtOrigin();
+        } else {
+            Gimbal_FinishMotion();
+        }
         return;
     }
 
@@ -366,6 +419,7 @@ void Gimbal_Update(void)
                             SERVO_CENTER_ANGLE_DEG) != HAL_OK) {
         g_gimbal_state.driver_fault = 1U;
         g_gimbal_state.moving = 0U;
+        Gimbal_CancelTemporaryMotion();
         Servo_StopAll();
         return;
     }
@@ -375,8 +429,132 @@ void Gimbal_Update(void)
     Gimbal_SyncCurrentFromServo();
 
     if (Gimbal_TargetArrived() != 0U) {
-        Gimbal_FinishMotion();
+        if (g_gimbal_state.reset_in_progress != 0U &&
+            g_gimbal_state.mode == GIMBAL_MODE_RESETTING) {
+            Gimbal_HoldAtOrigin();
+        } else {
+            Gimbal_FinishMotion();
+        }
     }
+}
+
+Gimbal_Status_t Gimbal_Pause(void)
+{
+    if (g_gimbal_state.initialized == 0U) {
+        return GIMBAL_STATUS_NOT_INITIALIZED;
+    }
+    if (g_gimbal_state.paused != 0U) {
+        return GIMBAL_STATUS_OK;
+    }
+    if (g_gimbal_state.waiting_start != 0U &&
+        g_gimbal_state.moving == 0U) {
+        return GIMBAL_STATUS_OK;
+    }
+
+    Gimbal_SyncCurrentFromServo();
+    g_pause_motion.target_yaw_deg = g_gimbal_state.target_yaw_deg;
+    g_pause_motion.target_pitch_deg = g_gimbal_state.target_pitch_deg;
+    g_pause_motion.mode = g_gimbal_state.mode;
+    g_pause_motion.valid = 1U;
+
+    Servo_StopAll();
+    Gimbal_SyncCurrentFromServo();
+    g_gimbal_state.target_yaw_deg = g_gimbal_state.current_yaw_deg;
+    g_gimbal_state.target_pitch_deg = g_gimbal_state.current_pitch_deg;
+    g_gimbal_state.command_yaw_deg = g_gimbal_state.current_yaw_deg;
+    g_gimbal_state.command_pitch_deg = g_gimbal_state.current_pitch_deg;
+    g_gimbal_state.mode = GIMBAL_MODE_PAUSED;
+    g_gimbal_state.moving = 0U;
+    g_gimbal_state.paused = 1U;
+    g_gimbal_state.resume_pending = 1U;
+    g_gimbal_state.waiting_start = 1U;
+    return GIMBAL_STATUS_OK;
+}
+
+Gimbal_Status_t Gimbal_Start(void)
+{
+    Gimbal_SavedMotion_t saved;
+
+    if (g_gimbal_state.initialized == 0U) {
+        return GIMBAL_STATUS_NOT_INITIALIZED;
+    }
+    if (g_gimbal_state.paused != 0U && g_pause_motion.valid != 0U) {
+        saved = g_pause_motion;
+        Gimbal_ClearSavedMotion(&g_pause_motion);
+        g_gimbal_state.paused = 0U;
+        g_gimbal_state.waiting_start = 0U;
+        g_gimbal_state.resume_pending =
+            (g_gimbal_state.reset_in_progress != 0U) ? 1U : 0U;
+        Gimbal_SyncCurrentFromServo();
+        Gimbal_SetMotionTarget(saved.target_yaw_deg,
+                               saved.target_pitch_deg,
+                               saved.mode);
+        if (g_gimbal_state.moving == 0U &&
+            g_gimbal_state.reset_in_progress != 0U &&
+            saved.mode == GIMBAL_MODE_RESETTING) {
+            Gimbal_HoldAtOrigin();
+        }
+        return GIMBAL_STATUS_OK;
+    }
+
+    if (g_gimbal_state.reset_in_progress != 0U &&
+        g_gimbal_state.waiting_start != 0U &&
+        g_reset_motion.valid != 0U) {
+        saved = g_reset_motion;
+        Gimbal_ClearSavedMotion(&g_reset_motion);
+        g_gimbal_state.reset_in_progress = 0U;
+        g_gimbal_state.resume_pending = 0U;
+        g_gimbal_state.waiting_start = 0U;
+        Gimbal_SyncCurrentFromServo();
+        Gimbal_SetMotionTarget(saved.target_yaw_deg,
+                               saved.target_pitch_deg,
+                               saved.mode);
+        if (g_gimbal_state.moving == 0U) {
+            Gimbal_FinishMotion();
+        }
+        return GIMBAL_STATUS_OK;
+    }
+
+    return GIMBAL_STATUS_INVALID_ARGUMENT;
+}
+
+Gimbal_Status_t Gimbal_Resume(void)
+{
+    return Gimbal_Start();
+}
+
+Gimbal_Status_t Gimbal_ResetToOrigin(void)
+{
+    if (g_gimbal_state.initialized == 0U) {
+        return GIMBAL_STATUS_NOT_INITIALIZED;
+    }
+    if (g_gimbal_state.reset_in_progress != 0U) {
+        return GIMBAL_STATUS_OK;
+    }
+
+    if (g_gimbal_state.paused != 0U && g_pause_motion.valid != 0U) {
+        g_reset_motion = g_pause_motion;
+    } else {
+        g_reset_motion.target_yaw_deg = g_gimbal_state.target_yaw_deg;
+        g_reset_motion.target_pitch_deg = g_gimbal_state.target_pitch_deg;
+        g_reset_motion.mode = g_gimbal_state.mode;
+        g_reset_motion.valid = 1U;
+    }
+
+    Gimbal_ClearSavedMotion(&g_pause_motion);
+    g_gimbal_state.paused = 0U;
+    g_gimbal_state.reset_in_progress = 1U;
+    g_gimbal_state.resume_pending = 1U;
+    g_gimbal_state.waiting_start = 0U;
+    Gimbal_SyncCurrentFromServo();
+    Gimbal_SetMotionTarget(GIMBAL_CENTER_ANGLE_DEG,
+                           GIMBAL_CENTER_ANGLE_DEG,
+                           GIMBAL_MODE_RESETTING);
+
+    if (g_gimbal_state.moving == 0U) {
+        Gimbal_HoldAtOrigin();
+    }
+    return GIMBAL_STATUS_OK;
 }
 
 void Gimbal_Stop(void)
@@ -389,6 +567,7 @@ void Gimbal_Stop(void)
      * 先记录 Servo 当前软件输出，再冻结 Servo 的目标和两级滤波器，最后
      * 再同步一次，确保云台当前位置、目标和底层保持角完全一致。
      */
+    Gimbal_CancelTemporaryMotion();
     Gimbal_SyncCurrentFromServo();
     Servo_StopAll();
     Gimbal_SyncCurrentFromServo();
