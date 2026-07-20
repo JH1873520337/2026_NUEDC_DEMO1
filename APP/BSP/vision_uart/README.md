@@ -77,12 +77,4 @@ if (mode == VISION_UART_MODE1) {
 
 `VisionUart_GetValidFrameCount()` and `VisionUart_GetInvalidFrameCount()` are
 available for serial-link diagnostics. `VisionUart_GetReceivedByteCount()`
-reports every byte delivered by USART1 RX DMA. The UART4 demo prints one of the
-following states:
-
-- `WAIT USART1 bytes=0`: STM32 receives no electrical UART data; check TX/RX,
-  common ground, firmware deployment, and baud rate.
-- `WAIT USART1 bytes>0 rx_ok=0 rx_bad>0`: bytes arrive but packets are invalid;
-  check baud rate and protocol version.
-- `MODE1 ...` or `MODE2 ...` with an increasing `rx_ok`: the complete link and
-  packet decoder are working.
+reports every byte delivered by USART1 RX DMA.
