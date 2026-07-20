@@ -149,7 +149,7 @@ void gimbal_update(void *argument)
   for(;;)
   {
     Task_Control_GimbalUpdate();
-    osDelay(5);
+    osDelay(10);
   }
 }
 

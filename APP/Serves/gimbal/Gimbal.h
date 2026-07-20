@@ -117,7 +117,7 @@ Gimbal_Status_t Gimbal_SetVector(float x, float y);
 
 /**
  * @brief 推进一次云台运动和底层舵机滤波。
- * @note 当前 FreeRTOS 更新任务每 5 ms 调用一次；使用本接口时不要额外调用 Servo_Update()。
+ * @note 当前 FreeRTOS 更新任务每 10 ms 调用一次；使用本接口时不要额外调用 Servo_Update()。
  */
 void Gimbal_Update(void);
 

@@ -140,7 +140,7 @@ void Task_Control_GimbalUpdate(void)
     if (gimbal_mutex == NULL || control_status.initialized == 0U) {
         return;
     }
-    if (xSemaphoreTake(gimbal_mutex, pdMS_TO_TICKS(5U)) == pdPASS) {
+    if (xSemaphoreTake(gimbal_mutex, pdMS_TO_TICKS(10U)) == pdPASS) {
         Gimbal_Update();
         (void)xSemaphoreGive(gimbal_mutex);
     }

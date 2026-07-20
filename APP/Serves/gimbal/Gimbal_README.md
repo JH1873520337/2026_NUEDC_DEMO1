@@ -30,11 +30,11 @@ if (Gimbal_Init() != GIMBAL_STATUS_OK) {
 ```c
 for (;;) {
     Gimbal_Update();
-    osDelay(5);
+    osDelay(10);
 }
 ```
 
-当前工程由 `freertos.c` 中的 `gimbal_update` 任务每 5 ms 调用一次。每次更新使用同一个缩放系数计算两轴步进，因此保持二维运动方向，同时保证任意一个舵机单次指令变化均不超过 2°。`Gimbal_Update()` 已在内部调用 `Servo_Update()`，使用云台层时不要在同一周期再次调用 `Servo_Update()`。
+当前工程由 `freertos.c` 中的 `gimbal_update` 任务每 10 ms 调用一次。每次更新使用同一个缩放系数计算两轴步进，因此保持二维运动方向，同时保证任意一个舵机单次指令变化均不超过 2°。`Gimbal_Update()` 已在内部调用 `Servo_Update()`，使用云台层时不要在同一周期再次调用 `Servo_Update()`。
 
 ## 绝对位置控制
 

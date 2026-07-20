@@ -118,8 +118,8 @@ TASK_CONTROL_COMMAND_SET_VECTOR
 
 | 项目 | 配置 |
 |---|---|
-| 更新周期 | 5 ms |
-| 延时方式 | `osDelay(5)` |
+| 更新周期 | 10 ms |
+| 延时方式 | `osDelay(10)` |
 | 优先级 | `osPriorityAboveNormal` |
 | 栈大小 | 256 words |
 

@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 /* The control task is the single owner of the Gimbal service. */
-/* Command dispatch stays at 10 ms; gimbal updates run in a separate 5 ms task. */
+/* Command dispatch and the separate gimbal update task both run every 10 ms. */
 #define TASK_CONTROL_PERIOD_MS             10U
 /* Eight values absorb short command bursts without hiding a full queue. */
 #define TASK_CONTROL_QUEUE_LENGTH          8U
