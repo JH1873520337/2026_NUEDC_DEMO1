@@ -1,4 +1,4 @@
-﻿# Servo 舵机驱动
+# Servo 舵机驱动
 
 ## 硬件参数
 
@@ -49,6 +49,17 @@ if (Servo_Init() != HAL_OK) {
 ```
 
 初始化后两个舵机均输出 90°。`Servo_Init()` 是 PWM 启动兼容的：即使 `main.c` 已经调用过 `HAL_TIM_PWM_Start()`，也不会重复启动该通道。
+
+## 安装方向反转
+
+当前机械安装要求 Yaw、Pitch 两个舵机都反向，配置位于 `Servo.h`：
+
+```c
+#define SERVO_YAW_REVERSED   1U
+#define SERVO_PITCH_REVERSED 1U
+```
+
+反向仅在最终 PWM 比较值换算时执行，即 `0° ↔ 180°`、`90°` 保持不变。上层仍使用正常的软件角和数学方向，因此不要在 `Gimbal.c` 中再次对角度取负。若以后改变安装方向，只需把相应宏改为 `0U`。
 
 ## 使用示例
 

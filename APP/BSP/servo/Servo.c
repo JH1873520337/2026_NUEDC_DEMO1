@@ -113,6 +113,16 @@ static uint32_t Servo_AngleToCompare(Servo_Id_t servo_id, float angle_deg)
     uint32_t compare_range;
 
     angle_deg = Servo_QuantizeAngle(angle_deg);
+
+    /*
+     * 根据实际安装方向在最终 PWM 映射处镜像角度：0°<->180°，90°保持不变。
+     * 软件状态仍保存反转前的逻辑角，避免上层云台坐标系和到达判断被硬件方向污染。
+     */
+    if (((servo_id == SERVO_YAW) && (SERVO_YAW_REVERSED != 0U)) ||
+        ((servo_id == SERVO_PITCH) && (SERVO_PITCH_REVERSED != 0U))) {
+        angle_deg = SERVO_MIN_ANGLE_DEG + SERVO_MAX_ANGLE_DEG - angle_deg;
+    }
+
     angle_tenths = (uint32_t)(angle_deg * 10.0f + 0.5f);
     compare_range = config->max_compare - config->min_compare;
 

@@ -1,89 +1,331 @@
 # Gimbal 二维云台驱动
 
-## 硬件映射
+## 1. 功能概述
 
-二维云台由两个 DS3115 舵机组成：
+本模块位于 `APP/Serves/gimbal`，建立在 `APP/BSP/servo` 的 DS3115 双舵机驱动之上，支持：
 
-| 轴 | 舵机 | PWM 通道 | 舵机机械角 | 云台软件角 |
-|---|---|---|---|---|
-| Yaw | 舵机 1 | TIM1_CH3（PE13） | 0~180° | -90~90° |
-| Pitch | 舵机 2 | TIM1_CH4（PE14） | 0~180° | -90~90° |
+- Yaw/Pitch 绝对位置控制；
+- Yaw/Pitch 相对位置控制；
+- 输入二维向量并沿该方向运动，直到任意一轴到达限制；
+- 四顶点矩形顺时针轨迹；
+- 每边 11 个等距点、每边 10 段、整周 40 段；
+- 每个矩形离散点到达后的视觉闭环修正；
+- 无视觉数据时不等待，继续执行正常轨迹；
+- 随时通过 `Gimbal_Stop()` 立即冻结当前位置。
 
-软件角 `0°` 对应舵机机械角 `90°`。云台层不直接操作 TIM，而是统一调用 `Servo` BSP。
+所有运动接口均为**非阻塞接口**。必须周期调用 `Gimbal_Update()`，否则只保存目标，不会继续推进舵机。
 
-## 初始化
+## 2. 硬件与坐标约定
+
+| 轴 | PWM 通道 | 舵机机械角 | 云台软件角 |
+|---|---|---:|---:|
+| Yaw | TIM1_CH3，PE13 | 0°~180° | -90°~90° |
+| Pitch | TIM1_CH4，PE14 | 0°~180° | -90°~90° |
+
+- 舵机机械角 90° 对应云台软件角 0°；
+- 纸面中心为 `(0,0)`；
+- X 向右，控制 Yaw；
+- Y 向上，控制 Pitch；
+- 纸面坐标和距离 D 的单位均为 cm；
+- 当前实际安装的两个舵机均在 Servo 层进行 PWM 方向反转，Gimbal 层不需要再次取反；
+- 如果视觉图像坐标的 Y 轴向下，调用视觉接口前必须转换为 `y_cm = -y_image_cm`。
+
+## 3. 初始化和周期更新
+
+调用顺序应为：
+
+1. HAL 和系统时钟初始化；
+2. GPIO、TIM1 等外设初始化；
+3. 调用 `Gimbal_Init()`；
+4. 主循环或 RTOS 周期任务中持续调用 `Gimbal_Update()`。
+
+`Gimbal_Init()` 内部会调用 `Servo_Init()`，因此应用层不需要再次单独启动两个 PWM 通道。初始化完成后两个舵机位于机械角 90°，云台软件角均记录为 0°。
+
+### 裸机示例
 
 ```c
 #include "Gimbal.h"
 
-if (Gimbal_Init() != GIMBAL_STATUS_OK) {
-    Error_Handler();
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_TIM1_Init();
+
+    if (Gimbal_Init() != GIMBAL_STATUS_OK) {
+        Error_Handler();
+    }
+
+    while (1) {
+        Gimbal_Update();
+        HAL_Delay(10);     /* 推荐固定 10 ms 周期 */
+    }
 }
 ```
 
-`Gimbal_Init()` 会调用 `Servo_Init()`，使两个舵机位于机械角 90°，随后将 Yaw、Pitch 的软件当前位置和目标位置都记录为 0°。
-
-## 周期更新
-
-控制接口只设置目标，实际运动由非阻塞函数 `Gimbal_Update()` 推进：
+### RTOS 示例
 
 ```c
-for (;;) {
-    Gimbal_Update();
-    osDelay(10);
+void GimbalTask(void *argument)
+{
+    if (Gimbal_Init() != GIMBAL_STATUS_OK) {
+        Error_Handler();
+    }
+
+    for (;;) {
+        Gimbal_Update();
+        osDelay(10);
+    }
 }
 ```
 
-建议以固定的 10 ms 周期调用。每次更新使用同一个缩放系数计算两轴步进，因此保持二维运动方向，同时保证任意一个舵机单次指令变化均不超过 2°。`Gimbal_Update()` 已在内部调用 `Servo_Update()`，使用云台层时不要在同一周期再次调用 `Servo_Update()`。
+> 不要用一个很长的 `HAL_Delay()` 代替周期更新。运动过程中每次双轴指令变化不超过 2°，滤波和分段运动都依赖持续调用 `Gimbal_Update()`。
 
-## 绝对位置控制
+## 4. 基本控制接口
+
+### 4.1 绝对位置
 
 ```c
 Gimbal_SetAbsolute(30.0f, -15.0f);
 ```
 
-目标表示相对于初始化正对方向的软件角度。超出 -90~90° 的输入会自动限制到安全范围。
+表示 Yaw 到 30°、Pitch 到 -15°。超出 -90°~90° 的目标会自动限幅。
 
-## 相对位置控制
+### 4.2 相对位置
 
 ```c
-Gimbal_SetRelative(5.0f, -2.0f);
+Gimbal_SetRelative(10.0f, 10.0f);
 ```
 
-相对量以调用瞬间结构体记录的当前位置为基准，而不是以上一次目标位置为基准。这样在运动过程中下发新命令时，不会把尚未完成的旧目标重复累计。
+表示以当前软件位置为基准，两轴各增加 10°。函数不会阻塞；调用后仍必须继续运行 `Gimbal_Update()`。
 
-## 向量控制
+如果要等待一次运动完成后再发送下一条相对命令，可使用：
+
+```c
+if (Gimbal_IsMoving() == 0U) {
+    Gimbal_SetRelative(10.0f, 10.0f);
+}
+```
+
+### 4.3 向量控制
 
 ```c
 Gimbal_SetVector(2.0f, 1.0f);
 ```
 
-- `X` 映射到 Yaw，`Y` 映射到 Pitch。
-- `(X, Y)` 表示云台初始正对方向垂直平面上的运动方向；向量长度不表示终点距离。
-- 驱动保持 `X:Y` 的方向比例向前运动，并预先计算沿该方向首先到达的机械边界。
-- 当任意一轴到达 `-90°` 或 `90°` 时，两轴同时停止，状态中的 `limit_reached` 置 1。
-- `(0, 0)` 没有方向，会立即停止并返回 `GIMBAL_STATUS_INVALID_ARGUMENT`。
+云台按 Yaw:Pitch = 2:1 的比例运动，直到 Yaw 或 Pitch 中任意一轴先到达 ±90°。到达限制后，`Gimbal_GetState()->limit_reached` 为 1。
 
-## 立即停止
+## 5. 矩形轨迹
+
+### 5.1 顶点输入
 
 ```c
-Gimbal_Stop();
+static const Gimbal_Point2D_t rectangle[4] = {
+    {-10.0f,  7.0f},
+    { 10.0f,  7.0f},
+    { 10.0f, -7.0f},
+    {-10.0f, -7.0f},
+};
 ```
 
-停止函数会立即把两轴目标锁定为当前 PWM 软件角度，并继续输出 PWM 以保持当前位置。由于系统没有舵机位置反馈，结构体中的当前位置是当前发送给舵机的角度，不是编码器实测角度。
+输入点的单位为 cm，均是相对纸面中心的坐标。模块会根据当前舵机安装和实际纸面投影方向，按极角升序排列四个顶点，使激光光斑在纸面上顺时针运动，并保持 `rectangle[0]` 为扫描起点。若以后改变舵机安装方向，应重新在实机上确认扫描方向。
 
-## 状态读取
+### 5.2 默认距离 D=100 cm
+
+当前激光笔转轴到纸面中心的垂直距离默认为 **100 cm**：
+
+```c
+Gimbal_StartRectangleDefault(rectangle);
+```
+
+等价于：
+
+```c
+Gimbal_StartRectangle(rectangle, 100.0f);
+```
+
+如果现场测得距离变化，应使用实际值，例如 `Gimbal_StartRectangle(rectangle, 98.5f)`。D 必须大于 0。
+
+### 5.3 直线和离散点
+
+相邻点 `P0(x0,y0)`、`P1(x1,y1)` 构成的边使用直线方程：
+
+```text
+A = y0 - y1
+B = x1 - x0
+C = x0*y1 - x1*y0
+A*x + B*y + C = 0
+```
+
+模块会把 A、B、C 归一化，使 `sqrt(A²+B²)=1`。每条边生成 11 个等距点：
+
+```text
+P(k) = P0 + (P1-P0) * k/10,  k=0...10
+```
+
+每边有 10 段，四边共 40 段。换边时不会重复运动公共顶点。
+
+### 5.4 点坐标到角度
+
+对于纸面点 `(X,Y)` 和距离 D：
+
+```text
+yaw   = atan2(X, D)
+pitch = atan2(Y, sqrt(D² + X²))
+```
+
+结果转换为角度后限制到 ±90°，再量化到 0.1°。
+
+## 6. 视觉数据接口（约 20 Hz）
+
+### 6.1 接口定义
+
+```c
+Gimbal_Status_t Gimbal_SubmitVisionSpot(float spot_x_cm,
+                                        float spot_y_cm);
+```
+
+参数是视觉检测到的**激光光斑相对纸面中心的坐标**，单位 cm。建议视觉模块约每 50 ms（20 Hz）提供一次有效数据。
+
+调用本函数表示“本帧确实检测到了有效光斑”。如果当前帧没有检测到光斑，**不要调用**该函数。云台不会等待视觉数据，而是在当前理论点完成后直接进入下一点。
+
+### 6.2 视觉接收示例
+
+```c
+void Vision_OnFrame(uint8_t has_spot,
+                    float spot_x_cm,
+                    float spot_y_image_cm)
+{
+    if (has_spot != 0U) {
+        /* 图像 Y 向下，云台纸面坐标 Y 向上，因此取反。 */
+        (void)Gimbal_SubmitVisionSpot(spot_x_cm,
+                                      -spot_y_image_cm);
+    }
+}
+```
+
+如果视觉已经直接输出“X 向右、Y 向上”的 cm 坐标，则不需要对 Y 取反。
+
+### 6.3 滤波流程
+
+每次提交有效视觉坐标时，X/Y 两轴分别执行：
+
+1. 一阶低通滤波；
+2. 一维卡尔曼滤波；
+3. 保存滤波坐标、时间戳和样本编号。
+
+默认参数位于 `Gimbal.h`：
+
+```c
+#define GIMBAL_VISION_FIRST_ORDER_ALPHA          0.40f
+#define GIMBAL_VISION_KALMAN_PROCESS_NOISE       0.02f
+#define GIMBAL_VISION_KALMAN_MEASURE_NOISE       0.15f
+#define GIMBAL_VISION_KALMAN_INITIAL_COV          1.0f
+#define GIMBAL_VISION_DATA_TIMEOUT_MS             150U
+```
+
+20 Hz 的帧周期约为 50 ms。超过 150 ms 没有新帧时，该数据对当前点视为无效，轨迹不会停下来等待。
+
+### 6.4 每个点的修正过程
+
+矩形轨迹到达一个理论点后，状态机按以下顺序处理：
+
+1. 检查是否存在尚未消费的新视觉样本；
+2. 检查该样本时间是否不超过 150 ms；
+3. 使用滤波后的光斑坐标作为实测点；
+4. 计算 `误差 = 理论点坐标 - 实测光斑坐标`；
+5. 若 X、Y 误差均不超过 0.30 cm，直接进入下一点；
+6. 否则将理论点和实测点分别换算为 Yaw/Pitch；
+7. 使用角度差对当前云台角做一次增量补偿；
+8. 修正动作完成后进入下一点。
+
+一个离散点最多执行一次视觉修正，防止同一点无限震荡。修正运动本身仍由 `Gimbal_Update()` 拆分为双轴每步不超过 2° 的动作。
+
+修正公式为：
+
+```text
+corrected_yaw   = current_yaw
+                + (desired_yaw - measured_yaw) * gain
+corrected_pitch = current_pitch
+                + (desired_pitch - measured_pitch) * gain
+```
+
+默认 `gain=1.0`。现场若出现过度修正或来回摆动，可适当减小 `GIMBAL_VISION_CORRECTION_GAIN`，例如 0.6~0.8。
+
+## 7. 完整组合示例
+
+```c
+#include "Gimbal.h"
+
+static const Gimbal_Point2D_t rectangle[4] = {
+    {-10.0f,  7.0f},
+    { 10.0f,  7.0f},
+    { 10.0f, -7.0f},
+    {-10.0f, -7.0f},
+};
+
+void App_Init(void)
+{
+    if (Gimbal_Init() != GIMBAL_STATUS_OK) {
+        Error_Handler();
+    }
+
+    /* 使用默认 D=100 cm，启动顺时针矩形轨迹。 */
+    if (Gimbal_StartRectangleDefault(rectangle) != GIMBAL_STATUS_OK) {
+        Error_Handler();
+    }
+}
+
+/* 由视觉接收/解析代码约 20 Hz 调用；无光斑时不调用。 */
+void App_OnVisionSpot(float x_cm, float y_cm)
+{
+    (void)Gimbal_SubmitVisionSpot(x_cm, y_cm);
+}
+
+/* 由主循环或 RTOS 任务固定周期调用。 */
+void App_10msTask(void)
+{
+    Gimbal_Update();
+}
+```
+
+视觉接口和云台更新接口不要放在长时间阻塞的代码后面。若由不同 RTOS 任务并发调用，应在应用层使用互斥锁或临界区保护；不建议在高优先级中断中执行浮点滤波。
+
+## 8. 状态读取与立即停止
 
 ```c
 const Gimbal_State_t *state = Gimbal_GetState();
 
-float yaw = state->current_yaw_deg;
-float pitch = state->current_pitch_deg;
-uint8_t moving = state->moving;
+if (state->rectangle_finished != 0U) {
+    /* 一圈 40 段已经完成 */
+}
+
+/* 紧急停止并保持当前位置 */
+Gimbal_Stop();
 ```
 
-`Gimbal_State_t` 同时保存当前位置、最终目标、当前分段指令、控制模式、原始向量、限位状态和底层驱动故障状态。
+常用状态字段：
 
-## 线程安全
+| 字段 | 含义 |
+|---|---|
+| `current_yaw_deg/current_pitch_deg` | 当前 PWM 软件角 |
+| `rectangle_active` | 矩形轨迹仍在运行 |
+| `rectangle_finished` | 40 段轨迹已完成 |
+| `rectangle_segments_completed` | 已完成的理论线段数量 |
+| `rectangle_correcting` | 正在执行当前点的视觉补偿 |
+| `rectangle_corrections_completed` | 已完成的视觉补偿次数 |
+| `vision_filtered_x_cm/y_cm` | 最新滤波光斑坐标 |
+| `vision_error_x_cm/y_cm` | 最近一次理论点与光斑的坐标误差 |
+| `vision_last_update_ms` | 最近有效视觉帧的 HAL tick |
+| `driver_fault` | 舵机驱动写入失败 |
 
-所有接口默认从同一个 RTOS 任务调用。如果多个任务都需要控制云台，应在上层使用互斥锁或消息队列串行化命令。
+## 9. 调试建议
+
+- 首先只调用 `Gimbal_Init()`，确认两个舵机都位于机械中位 90°；
+- 再测试小角度绝对/相对运动，确认 Yaw、Pitch 实际方向正确；
+- 确认视觉输出已经换算为相对中心的 cm，而不是像素；
+- 用固定光斑测试 `vision_raw_*` 和 `vision_filtered_*`，确认滤波坐标方向正确；
+- 轨迹测试时观察 `rectangle_edge_index`、`rectangle_point_index` 和 `rectangle_segments_completed`；
+- 若误差始终反向增大，优先检查视觉 X/Y 正方向和相机图像 Y 轴是否取反；
+- DS3115 应使用独立、足够电流的电源，并与 MCU 共地。

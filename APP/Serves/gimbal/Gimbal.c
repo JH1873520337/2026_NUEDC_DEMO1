@@ -1,46 +1,90 @@
 /**
  * @file Gimbal.c
- * @brief 二维云台绝对、相对、向量控制及分段运动实现。
+ * @brief 二维云台、矩形扫描轨迹以及视觉逐点闭环修正的实现。
  *
- * 云台层只处理软件角和运动状态，不直接访问定时器。底层映射为：
- *   Yaw 软件角   + 90° -> Servo_Yaw   -> TIM1_CH3
- *   Pitch 软件角 + 90° -> Servo_Pitch -> TIM1_CH4
- *
- * 所有运动均为非阻塞式：控制接口设置最终目标，Gimbal_Update() 每次计算
- * 一个双轴中间目标，并保证任意一轴相对当前位置的变化不超过 2°。
+ * 软件角定义：舵机 90° 为云台 0°；Yaw/Pitch 均限制在 -90°~90°。
+ * 运动由 Gimbal_Update() 非阻塞推进，每次给两个舵机下发的角度增量均不超过 2°。
+ * 矩形轨迹每边划分为 10 段（11 个端点），整周共 40 段。每到达一个理论点后，
+ * 状态机会尝试消费一帧不超过 150 ms 的视觉光斑坐标，完成至多一次增量修正，
+ * 然后继续下一个点；没有新鲜视觉数据时绝不等待。
  */
 #include "Gimbal.h"
+#include "KalmanFilter.h"
 
 #include <float.h>
+#include <math.h>
+#include <stddef.h>
 
-/** 小于该值的向量分量按 0 处理，避免极小数导致限位时间异常。 */
-#define GIMBAL_VECTOR_EPSILON  (1.0e-6f)
 
-/** 某一轴没有运动分量时，该轴到达限位所需的参数时间视为无穷大。 */
-#define GIMBAL_NO_LIMIT_TIME   (FLT_MAX)
+#define GIMBAL_VECTOR_EPSILON       (1.0e-6f)
 
-/** 云台单实例状态。所有公共接口默认由同一个 RTOS 任务串行调用。 */
+
+#define GIMBAL_GEOMETRY_EPSILON     (1.0e-5f)
+
+
+#define GIMBAL_NO_LIMIT_TIME        (FLT_MAX)
+
+
+#define GIMBAL_RAD_TO_DEG           (57.2957795130823208768f)
+
+
+#define GIMBAL_RECT_ADVANCE_GUARD   (GIMBAL_RECT_TOTAL_SEGMENTS + 2U)
+
+
 static Gimbal_State_t g_gimbal_state;
 
-/** 不依赖 libm 的浮点绝对值函数。 */
+
+static Gimbal_RectanglePath_t g_rectangle_path;
+
+/**
+ * @brief 视觉 X/Y 两通道的私有滤波状态。
+ *
+ * 原始坐标先经过一阶低通，再分别进入一维卡尔曼滤波器。last_used_sample_count
+ * 用于保证一个视觉样本最多只参与一次矩形点修正。
+ */
+typedef struct
+{
+    float low_pass_x_cm;
+    float low_pass_y_cm;
+    KalmanFilter_t kalman_x;
+    KalmanFilter_t kalman_y;
+    uint32_t last_used_sample_count;
+    uint8_t initialized;
+} Gimbal_VisionFilter_t;
+
+static Gimbal_VisionFilter_t g_vision_filter;
+
+/** 按极角排序时使用的临时顶点结构。 */
+typedef struct
+{
+    Gimbal_Point2D_t point;
+    float polar_angle_rad;
+    uint8_t original_index;
+} Gimbal_AngledVertex_t;
+
+
+/** 返回浮点绝对值，避免为简单运算额外依赖库函数。 */
 static float Gimbal_Abs(float value)
 {
     return (value < 0.0f) ? -value : value;
 }
 
-/** 返回两个浮点值中的较小者。 */
+
+/** 返回两个浮点数中的较小值。 */
 static float Gimbal_Min(float first, float second)
 {
     return (first < second) ? first : second;
 }
 
-/** 返回两个浮点值中的较大者。 */
+
+/** 返回两个浮点数中的较大值。 */
 static float Gimbal_Max(float first, float second)
 {
     return (first > second) ? first : second;
 }
 
-/** 将角度限制在云台软件安全范围内。 */
+
+/** 将 value 限制在 [minimum, maximum] 闭区间内。 */
 static float Gimbal_Clamp(float value, float minimum, float maximum)
 {
     if (value < minimum) {
@@ -52,10 +96,8 @@ static float Gimbal_Clamp(float value, float minimum, float maximum)
     return value;
 }
 
-/**
- * 检查输入是否为有限浮点数。
- * value == value 用于排除 NaN；FLT_MAX 比较用于排除正负无穷大。
- */
+
+/** 检查输入既不是 NaN，也没有超出有限 float 范围。 */
 static uint8_t Gimbal_IsFinite(float value)
 {
     return ((value == value) && (value <= FLT_MAX) && (value >= -FLT_MAX))
@@ -63,9 +105,10 @@ static uint8_t Gimbal_IsFinite(float value)
                : 0U;
 }
 
+
 /**
- * 将带符号软件角限制到 -90~90°，并四舍五入到最近的 0.1°。
- * 负数分支在转换为整数前减 0.5，以适配 C 语言向 0 截断的转换规则。
+ * @brief 将云台软件角限幅到 -90°~90°，并四舍五入到 0.1°。
+ * @note 对负数使用减 0.5 后截断，保证正负方向采用对称的四舍五入。
  */
 static float Gimbal_QuantizeAngle(float angle_deg)
 {
@@ -74,6 +117,7 @@ static float Gimbal_QuantizeAngle(float angle_deg)
     angle_deg = Gimbal_Clamp(angle_deg,
                              GIMBAL_MIN_ANGLE_DEG,
                              GIMBAL_MAX_ANGLE_DEG);
+
 
     if (angle_deg >= 0.0f) {
         angle_tenths = (int32_t)(angle_deg * 10.0f + 0.5f);
@@ -84,9 +128,10 @@ static float Gimbal_QuantizeAngle(float angle_deg)
     return (float)angle_tenths * SERVO_ANGLE_RESOLUTION_DEG;
 }
 
+
 /**
- * 从 Servo 层同步当前 PWM 软件角，并转换到以初始化正前方为 0° 的坐标。
- * 例如舵机机械角 120° 对应云台软件角 +30°。
+ * @brief 从舵机驱动读取当前 PWM 软件角，并转换成以 90° 为零点的云台角。
+ * @note 该值是软件输出角，不是编码器反馈得到的真实机械角。
  */
 static void Gimbal_SyncCurrentFromServo(void)
 {
@@ -98,7 +143,8 @@ static void Gimbal_SyncCurrentFromServo(void)
                              SERVO_CENTER_ANGLE_DEG);
 }
 
-/** 判断单轴当前角和目标角是否处于同一个 0.1° 分辨率位置。 */
+
+/** 判断单轴当前角与目标角之差是否在到达容差内。 */
 static uint8_t Gimbal_AxisArrived(float current_deg, float target_deg)
 {
     return (Gimbal_Abs(current_deg - target_deg) <=
@@ -107,7 +153,8 @@ static uint8_t Gimbal_AxisArrived(float current_deg, float target_deg)
                : 0U;
 }
 
-/** 只有 Yaw、Pitch 两轴同时到达，整个云台运动才算完成。 */
+
+/** 仅当 Yaw、Pitch 两轴同时到达目标时返回 1。 */
 static uint8_t Gimbal_TargetArrived(void)
 {
     return ((Gimbal_AxisArrived(g_gimbal_state.current_yaw_deg,
@@ -118,11 +165,26 @@ static uint8_t Gimbal_TargetArrived(void)
                : 0U;
 }
 
+
 /**
- * 统一建立一次新的最终目标。
- *
- * 最终目标先限幅并量化；中间指令从当前位置开始。若目标等于当前位置，
- * 则无需进入周期运动，直接冻结 Servo 滤波状态以防旧目标继续生效。
+ * @brief 取消矩形状态机和正在执行的视觉修正。
+ * @param clear_finished 非 0 时同时清除“上一轮轨迹已完成”标志。
+ */
+static void Gimbal_CancelRectangle(uint8_t clear_finished)
+{
+    g_gimbal_state.rectangle_active = 0U;
+    g_gimbal_state.rectangle_start_reached = 0U;
+    g_gimbal_state.rectangle_correcting = 0U;
+
+    if (clear_finished != 0U) {
+        g_gimbal_state.rectangle_finished = 0U;
+    }
+}
+
+
+/**
+ * @brief 保存新的双轴最终目标，并把分段指令起点设置为当前角度。
+ * @note 本函数不直接写 PWM；实际运动由 Gimbal_Update() 按每步不超过 2°推进。
  */
 static void Gimbal_SetMotionTarget(float yaw_deg,
                                    float pitch_deg,
@@ -142,15 +204,16 @@ static void Gimbal_SetMotionTarget(float yaw_deg,
     }
 }
 
+
 /**
- * 结束一次运动并冻结底层滤波器。
- * 向量模式的最终目标一定是首先碰到的轴边界，因此完成后置限位标志。
+ * @brief 完成当前运动，将软件状态吸附到目标并冻结 Servo 滤波器。
+ * @note 吸附可消除 0.1° 量化和到达容差造成的微小累计误差。
  */
 static void Gimbal_FinishMotion(void)
 {
     Gimbal_SyncCurrentFromServo();
 
-    /* 到达判断已通过，可将状态吸附到量化后的精确最终目标。 */
+
     g_gimbal_state.current_yaw_deg = g_gimbal_state.target_yaw_deg;
     g_gimbal_state.current_pitch_deg = g_gimbal_state.target_pitch_deg;
     g_gimbal_state.command_yaw_deg = g_gimbal_state.target_yaw_deg;
@@ -161,20 +224,395 @@ static void Gimbal_FinishMotion(void)
         g_gimbal_state.limit_reached = 1U;
     }
 
-    /* 保留 PWM 输出以提供舵机保持力，同时清除滤波历史。 */
+
     Servo_StopAll();
 }
 
+
+/** 使用勾股定理计算纸面上两个点之间的欧氏距离，单位 cm。 */
+static float Gimbal_PointDistance(const Gimbal_Point2D_t *first,
+                                  const Gimbal_Point2D_t *second)
+{
+    float delta_x = second->x_cm - first->x_cm;
+    float delta_y = second->y_cm - first->y_cm;
+
+    return sqrtf(delta_x * delta_x + delta_y * delta_y);
+}
+
+
+/**
+ * @brief 把任意输入顺序的四个顶点按绕中心的顺时针方向排序。
+ * @details 使用 atan2(y,x) 计算极角。根据当前云台安装方向和从激光器朝纸面观察的
+ *          实际投影方向，按极角升序排列才对应纸面上的顺时针扫描；排序完成后再
+ *          旋转数组，保证调用者给出的 vertices[0] 仍然是轨迹起点。
+ */
+static uint8_t Gimbal_OrderVerticesClockwise(
+    const Gimbal_Point2D_t input[GIMBAL_RECT_VERTEX_COUNT],
+    Gimbal_Point2D_t output[GIMBAL_RECT_VERTEX_COUNT])
+{
+    Gimbal_AngledVertex_t sorted[GIMBAL_RECT_VERTEX_COUNT];
+    Gimbal_AngledVertex_t temporary;
+    uint8_t first_position = 0U;
+    uint8_t index;
+    uint8_t scan;
+
+    for (index = 0U; index < GIMBAL_RECT_VERTEX_COUNT; ++index) {
+        float radius_squared;
+
+        if ((Gimbal_IsFinite(input[index].x_cm) == 0U) ||
+            (Gimbal_IsFinite(input[index].y_cm) == 0U)) {
+            return 0U;
+        }
+
+        radius_squared = input[index].x_cm * input[index].x_cm +
+                         input[index].y_cm * input[index].y_cm;
+        if (radius_squared <=
+            GIMBAL_GEOMETRY_EPSILON * GIMBAL_GEOMETRY_EPSILON) {
+
+            return 0U;
+        }
+
+        sorted[index].point = input[index];
+        sorted[index].polar_angle_rad =
+            atan2f(input[index].y_cm, input[index].x_cm);
+        sorted[index].original_index = index;
+    }
+
+
+    for (index = 1U; index < GIMBAL_RECT_VERTEX_COUNT; ++index) {
+        temporary = sorted[index];
+        scan = index;
+        /*
+         * 按极角升序排列。原先使用降序时，实机投影轨迹表现为逆时针；
+         * 改为升序后仅反转矩形遍历方向，不改变坐标到角度的换算和视觉修正方向。
+         */
+        while ((scan > 0U) &&
+               (sorted[scan - 1U].polar_angle_rad >
+                temporary.polar_angle_rad)) {
+            sorted[scan] = sorted[scan - 1U];
+            --scan;
+        }
+        sorted[scan] = temporary;
+    }
+
+    for (index = 0U; index < GIMBAL_RECT_VERTEX_COUNT; ++index) {
+        if (sorted[index].original_index == 0U) {
+            first_position = index;
+            break;
+        }
+    }
+
+
+    for (index = 0U; index < GIMBAL_RECT_VERTEX_COUNT; ++index) {
+        output[index] =
+            sorted[(uint8_t)((first_position + index) %
+                             GIMBAL_RECT_VERTEX_COUNT)]
+                .point;
+    }
+
+    return 1U;
+}
+
+
+/**
+ * @brief 检查相邻顶点不重合，并通过鞋带公式确认四边形面积非零。
+ * @return 1 表示几何数据可用，0 表示退化或无效。
+ */
+static uint8_t Gimbal_ValidateOrderedVertices(
+    const Gimbal_Point2D_t vertices[GIMBAL_RECT_VERTEX_COUNT])
+{
+    float twice_area = 0.0f;
+    uint8_t edge;
+
+    for (edge = 0U; edge < GIMBAL_RECT_EDGE_COUNT; ++edge) {
+        uint8_t next = (uint8_t)((edge + 1U) % GIMBAL_RECT_VERTEX_COUNT);
+
+        if (Gimbal_PointDistance(&vertices[edge], &vertices[next]) <=
+            GIMBAL_GEOMETRY_EPSILON) {
+            return 0U;
+        }
+
+        twice_area += vertices[edge].x_cm * vertices[next].y_cm -
+                      vertices[next].x_cm * vertices[edge].y_cm;
+    }
+
+    return (Gimbal_Abs(twice_area) > GIMBAL_GEOMETRY_EPSILON) ? 1U : 0U;
+}
+
+
+/**
+ * @brief 生成四条归一化直线方程及每边等距的 11 个离散点。
+ * @details 对边 P0->P1，方程为 A*x+B*y+C=0，并令 sqrt(A²+B²)=1；
+ *          离散点 P(k)=P0+(P1-P0)*k/10，k=0..10。
+ */
+static void Gimbal_BuildRectangleGeometry(void)
+{
+    uint8_t edge;
+
+    for (edge = 0U; edge < GIMBAL_RECT_EDGE_COUNT; ++edge) {
+        const Gimbal_Point2D_t *start = &g_rectangle_path.vertices[edge];
+        const Gimbal_Point2D_t *end =
+            &g_rectangle_path
+                 .vertices[(uint8_t)((edge + 1U) %
+                                     GIMBAL_RECT_VERTEX_COUNT)];
+        float a = start->y_cm - end->y_cm;
+        float b = end->x_cm - start->x_cm;
+        float c = start->x_cm * end->y_cm - end->x_cm * start->y_cm;
+        float normal_length = sqrtf(a * a + b * b);
+        uint8_t point_index;
+
+
+        g_rectangle_path.lines[edge].a = a / normal_length;
+        g_rectangle_path.lines[edge].b = b / normal_length;
+        g_rectangle_path.lines[edge].c = c / normal_length;
+
+        for (point_index = 0U;
+             point_index < GIMBAL_RECT_POINTS_PER_EDGE;
+             ++point_index) {
+            float ratio = (float)point_index /
+                          (float)GIMBAL_RECT_SEGMENTS_PER_EDGE;
+
+            g_rectangle_path.points[edge][point_index].x_cm =
+                start->x_cm + (end->x_cm - start->x_cm) * ratio;
+            g_rectangle_path.points[edge][point_index].y_cm =
+                start->y_cm + (end->y_cm - start->y_cm) * ratio;
+        }
+    }
+}
+
+
+/** 把指定矩形离散点换算为 Yaw/Pitch 角度并启动非阻塞运动。 */
+static void Gimbal_CommandRectanglePoint(uint8_t edge_index,
+                                         uint8_t point_index)
+{
+    float yaw_deg;
+    float pitch_deg;
+    const Gimbal_Point2D_t *point =
+        &g_rectangle_path.points[edge_index][point_index];
+
+
+    (void)Gimbal_PointToAngles(point,
+                               g_rectangle_path.distance_cm,
+                               &yaw_deg,
+                               &pitch_deg);
+
+    g_gimbal_state.rectangle_edge_index = edge_index;
+    g_gimbal_state.rectangle_point_index = point_index;
+    Gimbal_SetMotionTarget(yaw_deg, pitch_deg, GIMBAL_MODE_RECTANGLE);
+}
+
+
+/** 标记 40 段矩形轨迹全部完成，并清除未消费的视觉帧。 */
+static void Gimbal_FinishRectangle(void)
+{
+    g_gimbal_state.rectangle_active = 0U;
+    g_gimbal_state.rectangle_finished = 1U;
+    g_gimbal_state.rectangle_start_reached = 1U;
+    g_gimbal_state.rectangle_correcting = 0U;
+    g_gimbal_state.vision_data_fresh = 0U;
+    g_vision_filter.last_used_sample_count =
+        g_gimbal_state.vision_sample_count;
+    g_gimbal_state.rectangle_segments_completed =
+        GIMBAL_RECT_TOTAL_SEGMENTS;
+    g_gimbal_state.moving = 0U;
+}
+
+
+/**
+ * @brief 在当前点处理完成后选择并下发下一个矩形离散点。
+ * @details 每条边的 point[10] 与下一条边的 point[0] 是同一顶点，因此换边时
+ *          从 point[1] 开始，确保整周正好运动 40 段且不重复停留顶点。
+ */
+static void Gimbal_AdvanceRectangleAfterTarget(void)
+{
+    uint8_t guard = 0U;
+
+    while ((g_gimbal_state.rectangle_active != 0U) &&
+           (guard < GIMBAL_RECT_ADVANCE_GUARD)) {
+        uint8_t next_edge;
+        uint8_t next_point;
+
+        ++guard;
+
+        if (g_gimbal_state.rectangle_start_reached == 0U) {
+
+            g_gimbal_state.rectangle_start_reached = 1U;
+            next_edge = 0U;
+            next_point = 1U;
+        } else {
+            ++g_gimbal_state.rectangle_segments_completed;
+
+            if (g_gimbal_state.rectangle_segments_completed >=
+                GIMBAL_RECT_TOTAL_SEGMENTS) {
+                Gimbal_FinishRectangle();
+                return;
+            }
+
+            if (g_gimbal_state.rectangle_point_index <
+                GIMBAL_RECT_SEGMENTS_PER_EDGE) {
+                next_edge = g_gimbal_state.rectangle_edge_index;
+                next_point =
+                    (uint8_t)(g_gimbal_state.rectangle_point_index + 1U);
+            } else {
+
+                next_edge =
+                    (uint8_t)(g_gimbal_state.rectangle_edge_index + 1U);
+                next_point = 1U;
+            }
+        }
+
+        Gimbal_CommandRectanglePoint(next_edge, next_point);
+
+        if (g_gimbal_state.moving != 0U) {
+            return;
+        }
+
+    }
+
+    if (g_gimbal_state.rectangle_active != 0U) {
+
+        Gimbal_CancelRectangle(1U);
+        g_gimbal_state.driver_fault = 1U;
+        g_gimbal_state.mode = GIMBAL_MODE_STOPPED;
+        g_gimbal_state.moving = 0U;
+        Servo_StopAll();
+    }
+}
+
+
+/**
+ * @brief 尝试使用一帧新鲜视觉坐标修正刚刚到达的矩形离散点。
+ *
+ * @return 1 表示已经启动一个非零修正动作，状态机应等待该动作完成；
+ *         0 表示无新数据、数据过期、误差已足够小或量化后无需运动，可直接去下一点。
+ */
+static uint8_t Gimbal_TryStartVisionCorrection(void)
+{
+    const Gimbal_Point2D_t *desired_point;
+    Gimbal_Point2D_t measured_point;
+    float desired_yaw_deg;
+    float desired_pitch_deg;
+    float measured_yaw_deg;
+    float measured_pitch_deg;
+    float corrected_yaw_deg;
+    float corrected_pitch_deg;
+    uint32_t now_ms;
+
+    if ((g_gimbal_state.vision_valid == 0U) ||
+        (g_gimbal_state.vision_data_fresh == 0U) ||
+        (g_gimbal_state.vision_sample_count ==
+         g_vision_filter.last_used_sample_count)) {
+        return 0U;
+    }
+
+    /* 先标记为已消费，确保同一帧不会被后续矩形点重复使用。 */
+    g_vision_filter.last_used_sample_count =
+        g_gimbal_state.vision_sample_count;
+    g_gimbal_state.vision_data_fresh = 0U;
+
+    now_ms = HAL_GetTick();
+    if ((uint32_t)(now_ms - g_gimbal_state.vision_last_update_ms) >
+        GIMBAL_VISION_DATA_TIMEOUT_MS) {
+        return 0U;
+    }
+
+    desired_point =
+        &g_rectangle_path.points[g_gimbal_state.rectangle_edge_index]
+                                [g_gimbal_state.rectangle_point_index];
+    measured_point.x_cm = g_gimbal_state.vision_filtered_x_cm;
+    measured_point.y_cm = g_gimbal_state.vision_filtered_y_cm;
+
+    g_gimbal_state.vision_error_x_cm =
+        desired_point->x_cm - measured_point.x_cm;
+    g_gimbal_state.vision_error_y_cm =
+        desired_point->y_cm - measured_point.y_cm;
+
+    if ((Gimbal_Abs(g_gimbal_state.vision_error_x_cm) <=
+         GIMBAL_VISION_CORRECTION_TOLERANCE_CM) &&
+        (Gimbal_Abs(g_gimbal_state.vision_error_y_cm) <=
+         GIMBAL_VISION_CORRECTION_TOLERANCE_CM)) {
+        return 0U;
+    }
+
+    /*
+     * 不直接重新下发理论角，而是计算“理论点角度 - 实测光斑角度”，再把该差值
+     * 叠加到当前云台角度上。这样能够补偿安装偏差、舵机误差和机构误差。
+     */
+    if ((Gimbal_PointToAngles(desired_point,
+                              g_rectangle_path.distance_cm,
+                              &desired_yaw_deg,
+                              &desired_pitch_deg) != GIMBAL_STATUS_OK) ||
+        (Gimbal_PointToAngles(&measured_point,
+                              g_rectangle_path.distance_cm,
+                              &measured_yaw_deg,
+                              &measured_pitch_deg) != GIMBAL_STATUS_OK)) {
+        return 0U;
+    }
+
+    corrected_yaw_deg =
+        g_gimbal_state.current_yaw_deg +
+        (desired_yaw_deg - measured_yaw_deg) *
+            GIMBAL_VISION_CORRECTION_GAIN;
+    corrected_pitch_deg =
+        g_gimbal_state.current_pitch_deg +
+        (desired_pitch_deg - measured_pitch_deg) *
+            GIMBAL_VISION_CORRECTION_GAIN;
+
+    g_gimbal_state.rectangle_correcting = 1U;
+    Gimbal_SetMotionTarget(corrected_yaw_deg,
+                           corrected_pitch_deg,
+                           GIMBAL_MODE_RECTANGLE);
+
+    if (g_gimbal_state.moving == 0U) {
+        /* 修正量经 0.1° 量化后为零，不能让矩形状态机停在 correcting 状态。 */
+        g_gimbal_state.rectangle_correcting = 0U;
+        return 0U;
+    }
+
+    return 1U;
+}
+
+/** 到达普通目标或视觉修正目标后的统一状态机入口。 */
+static void Gimbal_HandleTargetArrival(void)
+{
+    Gimbal_FinishMotion();
+
+    if (g_gimbal_state.rectangle_active == 0U) {
+        return;
+    }
+
+    if (g_gimbal_state.rectangle_correcting != 0U) {
+        /*
+         * 每个离散点只修正一次。修正运动期间收到的视觉帧对应旧点，在进入
+         * 下一点前一并丢弃，避免误用为下一点的测量值。
+         */
+        g_gimbal_state.rectangle_correcting = 0U;
+        ++g_gimbal_state.rectangle_corrections_completed;
+        g_vision_filter.last_used_sample_count =
+            g_gimbal_state.vision_sample_count;
+        g_gimbal_state.vision_data_fresh = 0U;
+        Gimbal_AdvanceRectangleAfterTarget();
+        return;
+    }
+
+    if (Gimbal_TryStartVisionCorrection() != 0U) {
+        return;
+    }
+
+    Gimbal_AdvanceRectangleAfterTarget();
+}
+
+/** 初始化舵机、云台状态、矩形状态和视觉滤波状态；初始化后双轴软件角为 0°。 */
 Gimbal_Status_t Gimbal_Init(void)
 {
-    /* Servo_Init() 会写入 90° 比较值并启动 TIM1_CH3/CH4。 */
+
     if (Servo_Init() != HAL_OK) {
         g_gimbal_state.initialized = 0U;
         g_gimbal_state.driver_fault = 1U;
         return GIMBAL_STATUS_DRIVER_ERROR;
     }
 
-    /* 机械角 90° 映射为云台软件坐标原点 0°。 */
+
     g_gimbal_state.current_yaw_deg = GIMBAL_CENTER_ANGLE_DEG;
     g_gimbal_state.current_pitch_deg = GIMBAL_CENTER_ANGLE_DEG;
     g_gimbal_state.target_yaw_deg = GIMBAL_CENTER_ANGLE_DEG;
@@ -188,10 +626,35 @@ Gimbal_Status_t Gimbal_Init(void)
     g_gimbal_state.moving = 0U;
     g_gimbal_state.limit_reached = 0U;
     g_gimbal_state.driver_fault = 0U;
+    g_gimbal_state.rectangle_active = 0U;
+    g_gimbal_state.rectangle_finished = 0U;
+    g_gimbal_state.rectangle_start_reached = 0U;
+    g_gimbal_state.rectangle_edge_index = 0U;
+    g_gimbal_state.rectangle_point_index = 0U;
+    g_gimbal_state.rectangle_segments_completed = 0U;
+    g_gimbal_state.rectangle_correcting = 0U;
+    g_gimbal_state.rectangle_corrections_completed = 0U;
+
+    g_gimbal_state.vision_valid = 0U;
+    g_gimbal_state.vision_data_fresh = 0U;
+    g_gimbal_state.vision_raw_x_cm = 0.0f;
+    g_gimbal_state.vision_raw_y_cm = 0.0f;
+    g_gimbal_state.vision_filtered_x_cm = 0.0f;
+    g_gimbal_state.vision_filtered_y_cm = 0.0f;
+    g_gimbal_state.vision_error_x_cm = 0.0f;
+    g_gimbal_state.vision_error_y_cm = 0.0f;
+    g_gimbal_state.vision_last_update_ms = 0U;
+    g_gimbal_state.vision_sample_count = 0U;
+
+    g_vision_filter.low_pass_x_cm = 0.0f;
+    g_vision_filter.low_pass_y_cm = 0.0f;
+    g_vision_filter.last_used_sample_count = 0U;
+    g_vision_filter.initialized = 0U;
 
     return GIMBAL_STATUS_OK;
 }
 
+/** 启动绝对位置运动；新命令会取消正在运行的矩形轨迹。 */
 Gimbal_Status_t Gimbal_SetAbsolute(float yaw_deg, float pitch_deg)
 {
     if (g_gimbal_state.initialized == 0U) {
@@ -202,8 +665,10 @@ Gimbal_Status_t Gimbal_SetAbsolute(float yaw_deg, float pitch_deg)
         return GIMBAL_STATUS_INVALID_ARGUMENT;
     }
 
-    /* 新命令以 Servo 当前软件输出为运动起点，而不是旧的中间指令。 */
+
+    Gimbal_CancelRectangle(1U);
     Gimbal_SyncCurrentFromServo();
+    Servo_StopAll();
     g_gimbal_state.vector_x = 0.0f;
     g_gimbal_state.vector_y = 0.0f;
     Gimbal_SetMotionTarget(yaw_deg, pitch_deg, GIMBAL_MODE_ABSOLUTE);
@@ -211,6 +676,7 @@ Gimbal_Status_t Gimbal_SetAbsolute(float yaw_deg, float pitch_deg)
     return GIMBAL_STATUS_OK;
 }
 
+/** 以当前 PWM 软件角为基准启动相对位置运动，并自动限制到 ±90°。 */
 Gimbal_Status_t Gimbal_SetRelative(float delta_yaw_deg,
                                    float delta_pitch_deg)
 {
@@ -222,8 +688,10 @@ Gimbal_Status_t Gimbal_SetRelative(float delta_yaw_deg,
         return GIMBAL_STATUS_INVALID_ARGUMENT;
     }
 
-    /* 相对控制严格以调用瞬间的位置为零点，随后统一进行 ±90° 限幅。 */
+
+    Gimbal_CancelRectangle(1U);
     Gimbal_SyncCurrentFromServo();
+    Servo_StopAll();
     g_gimbal_state.vector_x = 0.0f;
     g_gimbal_state.vector_y = 0.0f;
     Gimbal_SetMotionTarget(g_gimbal_state.current_yaw_deg + delta_yaw_deg,
@@ -233,6 +701,10 @@ Gimbal_Status_t Gimbal_SetRelative(float delta_yaw_deg,
     return GIMBAL_STATUS_OK;
 }
 
+/**
+ * @brief 沿输入向量 (X,Y) 的方向持续运动，直到任意一轴先到达 ±90°。
+ * @details 对向量按最大分量归一化，保持 Yaw 与 Pitch 运动比例不变。
+ */
 Gimbal_Status_t Gimbal_SetVector(float x, float y)
 {
     float max_component;
@@ -251,29 +723,20 @@ Gimbal_Status_t Gimbal_SetVector(float x, float y)
         return GIMBAL_STATUS_INVALID_ARGUMENT;
     }
 
-    /*
-     * 使用无穷范数 max(|X|,|Y|) 归一化，既保持 X:Y 比例，也使两个方向
-     * 分量都位于 [-1,1]。向量长度不参与目标距离计算。
-     */
+
     max_component = Gimbal_Max(Gimbal_Abs(x), Gimbal_Abs(y));
     if (max_component <= GIMBAL_VECTOR_EPSILON) {
-        /* 零向量没有运动方向，按立即停止处理。 */
         Gimbal_Stop();
         return GIMBAL_STATUS_INVALID_ARGUMENT;
     }
 
+    Gimbal_CancelRectangle(1U);
     Gimbal_SyncCurrentFromServo();
+    Servo_StopAll();
     direction_yaw = x / max_component;
     direction_pitch = y / max_component;
 
-    /*
-     * 云台在软件角平面中的射线方程：
-     *   yaw(t)   = current_yaw   + direction_yaw   * t
-     *   pitch(t) = current_pitch + direction_pitch * t
-     *
-     * 分别求两轴沿当前方向到达 ±90° 所需的正参数 t，取较小值即为
-     * 首先发生的机械限位。分量为 0 的轴不会到达新限位，保持 FLT_MAX。
-     */
+
     if (direction_yaw > GIMBAL_VECTOR_EPSILON) {
         yaw_limit_time =
             (GIMBAL_MAX_ANGLE_DEG - g_gimbal_state.current_yaw_deg) /
@@ -299,7 +762,6 @@ Gimbal_Status_t Gimbal_SetVector(float x, float y)
         return GIMBAL_STATUS_INVALID_ARGUMENT;
     }
 
-    /* 沿原向量方向计算首个限位点，最终仍会按 0.1° 量化。 */
     target_yaw = g_gimbal_state.current_yaw_deg +
                  direction_yaw * limit_time;
     target_pitch = g_gimbal_state.current_pitch_deg +
@@ -309,7 +771,6 @@ Gimbal_Status_t Gimbal_SetVector(float x, float y)
     g_gimbal_state.vector_y = y;
     Gimbal_SetMotionTarget(target_yaw, target_pitch, GIMBAL_MODE_VECTOR);
 
-    /* 如果命令下发时已经位于该方向的边界，则无需运动，直接报告限位。 */
     if (g_gimbal_state.moving == 0U) {
         g_gimbal_state.limit_reached = 1U;
     }
@@ -317,6 +778,174 @@ Gimbal_Status_t Gimbal_SetVector(float x, float y)
     return GIMBAL_STATUS_OK;
 }
 
+/**
+ * @brief 根据纸面坐标和垂直距离 D 计算激光指向角。
+ * @details yaw=atan2(X,D)，pitch=atan2(Y,sqrt(D²+X²))，最后量化到 0.1°。
+ */
+Gimbal_Status_t Gimbal_PointToAngles(const Gimbal_Point2D_t *point,
+                                     float distance_cm,
+                                     float *yaw_deg,
+                                     float *pitch_deg)
+{
+    float yaw_rad;
+    float pitch_rad;
+    float horizontal_distance_cm;
+
+    if ((point == NULL) || (yaw_deg == NULL) || (pitch_deg == NULL) ||
+        (Gimbal_IsFinite(point->x_cm) == 0U) ||
+        (Gimbal_IsFinite(point->y_cm) == 0U) ||
+        (Gimbal_IsFinite(distance_cm) == 0U) ||
+        (distance_cm <= GIMBAL_GEOMETRY_EPSILON)) {
+        return GIMBAL_STATUS_INVALID_ARGUMENT;
+    }
+
+
+    horizontal_distance_cm =
+        sqrtf(distance_cm * distance_cm + point->x_cm * point->x_cm);
+    yaw_rad = atan2f(point->x_cm, distance_cm);
+    pitch_rad = atan2f(point->y_cm, horizontal_distance_cm);
+
+    *yaw_deg = Gimbal_QuantizeAngle(yaw_rad * GIMBAL_RAD_TO_DEG);
+    *pitch_deg = Gimbal_QuantizeAngle(pitch_rad * GIMBAL_RAD_TO_DEG);
+
+    return GIMBAL_STATUS_OK;
+}
+
+/**
+ * @brief 接收一帧有效光斑坐标，并依次执行一阶低通与 X/Y 卡尔曼滤波。
+ * @note 建议约 20 Hz 调用；未识别到光斑时不要调用本函数。
+ */
+Gimbal_Status_t Gimbal_SubmitVisionSpot(float spot_x_cm, float spot_y_cm)
+{
+    if (g_gimbal_state.initialized == 0U) {
+        return GIMBAL_STATUS_NOT_INITIALIZED;
+    }
+    if ((Gimbal_IsFinite(spot_x_cm) == 0U) ||
+        (Gimbal_IsFinite(spot_y_cm) == 0U)) {
+        return GIMBAL_STATUS_INVALID_ARGUMENT;
+    }
+
+    g_gimbal_state.vision_raw_x_cm = spot_x_cm;
+    g_gimbal_state.vision_raw_y_cm = spot_y_cm;
+
+    if (g_vision_filter.initialized == 0U) {
+        /* 第一帧直接作为初值，避免滤波输出从 (0,0) 缓慢爬向真实坐标。 */
+        g_vision_filter.low_pass_x_cm = spot_x_cm;
+        g_vision_filter.low_pass_y_cm = spot_y_cm;
+        KalmanFilter_Init(&g_vision_filter.kalman_x,
+                          GIMBAL_VISION_KALMAN_PROCESS_NOISE,
+                          GIMBAL_VISION_KALMAN_MEASURE_NOISE,
+                          spot_x_cm,
+                          GIMBAL_VISION_KALMAN_INITIAL_COV);
+        KalmanFilter_Init(&g_vision_filter.kalman_y,
+                          GIMBAL_VISION_KALMAN_PROCESS_NOISE,
+                          GIMBAL_VISION_KALMAN_MEASURE_NOISE,
+                          spot_y_cm,
+                          GIMBAL_VISION_KALMAN_INITIAL_COV);
+        g_gimbal_state.vision_filtered_x_cm = spot_x_cm;
+        g_gimbal_state.vision_filtered_y_cm = spot_y_cm;
+        g_vision_filter.initialized = 1U;
+    } else {
+        /* 一阶低通抑制单帧跳变，再用卡尔曼滤波降低连续测量噪声。 */
+        g_vision_filter.low_pass_x_cm +=
+            GIMBAL_VISION_FIRST_ORDER_ALPHA *
+            (spot_x_cm - g_vision_filter.low_pass_x_cm);
+        g_vision_filter.low_pass_y_cm +=
+            GIMBAL_VISION_FIRST_ORDER_ALPHA *
+            (spot_y_cm - g_vision_filter.low_pass_y_cm);
+
+        g_gimbal_state.vision_filtered_x_cm =
+            KalmanFilter_Update(&g_vision_filter.kalman_x,
+                                g_vision_filter.low_pass_x_cm);
+        g_gimbal_state.vision_filtered_y_cm =
+            KalmanFilter_Update(&g_vision_filter.kalman_y,
+                                g_vision_filter.low_pass_y_cm);
+    }
+
+    g_gimbal_state.vision_valid = 1U;
+    g_gimbal_state.vision_data_fresh = 1U;
+    g_gimbal_state.vision_last_update_ms = HAL_GetTick();
+    ++g_gimbal_state.vision_sample_count;
+
+    return GIMBAL_STATUS_OK;
+}
+
+/**
+ * @brief 建立矩形几何数据并启动顺时针、40 段、可视觉修正的非阻塞轨迹。
+ * @param vertices 四个顶点坐标，单位 cm；vertices[0] 作为起点。
+ * @param distance_cm 激光转轴到纸面中心的垂直距离 D，单位 cm。
+ */
+Gimbal_Status_t Gimbal_StartRectangle(
+    const Gimbal_Point2D_t vertices[GIMBAL_RECT_VERTEX_COUNT],
+    float distance_cm)
+{
+    Gimbal_Point2D_t ordered_vertices[GIMBAL_RECT_VERTEX_COUNT];
+    uint8_t index;
+
+    if (g_gimbal_state.initialized == 0U) {
+        return GIMBAL_STATUS_NOT_INITIALIZED;
+    }
+    if ((vertices == NULL) || (Gimbal_IsFinite(distance_cm) == 0U) ||
+        (distance_cm <= GIMBAL_GEOMETRY_EPSILON)) {
+        return GIMBAL_STATUS_INVALID_ARGUMENT;
+    }
+
+    if ((Gimbal_OrderVerticesClockwise(vertices, ordered_vertices) == 0U) ||
+        (Gimbal_ValidateOrderedVertices(ordered_vertices) == 0U)) {
+        return GIMBAL_STATUS_INVALID_ARGUMENT;
+    }
+
+
+    Gimbal_SyncCurrentFromServo();
+    Servo_StopAll();
+    Gimbal_CancelRectangle(1U);
+
+    for (index = 0U; index < GIMBAL_RECT_VERTEX_COUNT; ++index) {
+        g_rectangle_path.vertices[index] = ordered_vertices[index];
+    }
+    g_rectangle_path.distance_cm = distance_cm;
+    Gimbal_BuildRectangleGeometry();
+
+    g_gimbal_state.vector_x = 0.0f;
+    g_gimbal_state.vector_y = 0.0f;
+    g_gimbal_state.rectangle_active = 1U;
+    g_gimbal_state.rectangle_finished = 0U;
+    g_gimbal_state.rectangle_start_reached = 0U;
+    g_gimbal_state.rectangle_edge_index = 0U;
+    g_gimbal_state.rectangle_point_index = 0U;
+    g_gimbal_state.rectangle_segments_completed = 0U;
+    g_gimbal_state.rectangle_correcting = 0U;
+    g_gimbal_state.rectangle_corrections_completed = 0U;
+    g_vision_filter.last_used_sample_count =
+        g_gimbal_state.vision_sample_count;
+    g_gimbal_state.vision_data_fresh = 0U;
+    g_gimbal_state.vision_error_x_cm = 0.0f;
+    g_gimbal_state.vision_error_y_cm = 0.0f;
+
+    Gimbal_CommandRectanglePoint(0U, 0U);
+
+    if (g_gimbal_state.moving == 0U) {
+
+        Gimbal_AdvanceRectangleAfterTarget();
+    }
+
+    return (g_gimbal_state.driver_fault == 0U)
+               ? GIMBAL_STATUS_OK
+               : GIMBAL_STATUS_DRIVER_ERROR;
+}
+
+/** 使用 GIMBAL_DEFAULT_TARGET_DISTANCE_CM（当前为 100 cm）启动矩形轨迹。 */
+Gimbal_Status_t Gimbal_StartRectangleDefault(
+    const Gimbal_Point2D_t vertices[GIMBAL_RECT_VERTEX_COUNT])
+{
+    return Gimbal_StartRectangle(vertices,
+                                 GIMBAL_DEFAULT_TARGET_DISTANCE_CM);
+}
+
+/**
+ * @brief 推进一次双轴运动和矩形/视觉状态机。
+ * @note 推荐固定每 10 ms 调用一次；函数不包含 HAL_Delay()。
+ */
 void Gimbal_Update(void)
 {
     float yaw_error;
@@ -329,11 +958,11 @@ void Gimbal_Update(void)
         return;
     }
 
-    /* 每个周期都从 Servo 层同步，保证状态基于实际写出的 PWM 软件角。 */
+
     Gimbal_SyncCurrentFromServo();
 
     if (Gimbal_TargetArrived() != 0U) {
-        Gimbal_FinishMotion();
+        Gimbal_HandleTargetArrival();
         return;
     }
 
@@ -342,13 +971,7 @@ void Gimbal_Update(void)
     pitch_error = g_gimbal_state.target_pitch_deg -
                   g_gimbal_state.current_pitch_deg;
 
-    /*
-     * 两轴共享同一个 step_scale：
-     *   scale = min(1, 2 / max(|yaw_error|, |pitch_error|))
-     *
-     * 因此较大误差轴每次最多移动 2°，另一轴按相同比例移动，不仅满足
-     * “两个舵机每次都不大于 2°”，还可以保持二维轨迹的方向比例。
-     */
+
     max_error = Gimbal_Max(Gimbal_Abs(yaw_error), Gimbal_Abs(pitch_error));
     step_scale = (max_error > GIMBAL_MAX_STEP_DEG)
                      ? (GIMBAL_MAX_STEP_DEG / max_error)
@@ -359,36 +982,35 @@ void Gimbal_Update(void)
     g_gimbal_state.command_pitch_deg = Gimbal_QuantizeAngle(
         g_gimbal_state.current_pitch_deg + pitch_error * step_scale);
 
-    /* 云台软件角加 90° 后转换为 Servo 层需要的 0~180° 机械角。 */
+
     if (Servo_SetAngles(g_gimbal_state.command_yaw_deg +
                             SERVO_CENTER_ANGLE_DEG,
                         g_gimbal_state.command_pitch_deg +
                             SERVO_CENTER_ANGLE_DEG) != HAL_OK) {
         g_gimbal_state.driver_fault = 1U;
         g_gimbal_state.moving = 0U;
+        Gimbal_CancelRectangle(1U);
         Servo_StopAll();
         return;
     }
 
-    /* 推进一阶低通、卡尔曼滤波并更新 CCR3/CCR4。 */
+
     Servo_Update();
     Gimbal_SyncCurrentFromServo();
 
     if (Gimbal_TargetArrived() != 0U) {
-        Gimbal_FinishMotion();
+        Gimbal_HandleTargetArrival();
     }
 }
 
+/** 立即冻结当前 PWM 软件位置，并取消矩形轨迹和视觉修正。 */
 void Gimbal_Stop(void)
 {
     if (g_gimbal_state.initialized == 0U) {
         return;
     }
 
-    /*
-     * 先记录 Servo 当前软件输出，再冻结 Servo 的目标和两级滤波器，最后
-     * 再同步一次，确保云台当前位置、目标和底层保持角完全一致。
-     */
+
     Gimbal_SyncCurrentFromServo();
     Servo_StopAll();
     Gimbal_SyncCurrentFromServo();
@@ -402,15 +1024,27 @@ void Gimbal_Stop(void)
     g_gimbal_state.mode = GIMBAL_MODE_STOPPED;
     g_gimbal_state.moving = 0U;
     g_gimbal_state.limit_reached = 0U;
+    Gimbal_CancelRectangle(1U);
 }
 
+/** 普通运动或矩形状态机仍活动时返回 1。 */
 uint8_t Gimbal_IsMoving(void)
 {
-    return g_gimbal_state.moving;
+
+    return ((g_gimbal_state.moving != 0U) ||
+            (g_gimbal_state.rectangle_active != 0U))
+               ? 1U
+               : 0U;
 }
 
+/** 返回云台只读运行状态，供调试、遥测和上层状态判断使用。 */
 const Gimbal_State_t *Gimbal_GetState(void)
 {
-    /* 返回内部只读视图；调用者不应去除 const 后修改状态。 */
     return &g_gimbal_state;
+}
+
+/** 返回最近一次生成的矩形顶点、直线方程和 44 个边内点。 */
+const Gimbal_RectanglePath_t *Gimbal_GetRectanglePath(void)
+{
+    return &g_rectangle_path;
 }
