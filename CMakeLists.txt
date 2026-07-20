@@ -48,6 +48,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     APP/Algorithm/KalmanFilter.c
     APP/BSP/servo/Servo.c
     APP/Serves/gimbal/Gimbal.c
+    Task/task_control.c
+    Task/task_communication.c
 )
 
 # Add include paths
@@ -56,6 +58,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     APP/Algorithm
     APP/BSP/servo
     APP/Serves/gimbal
+    Task
 )
 
 # Add project symbols (macros)

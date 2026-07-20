@@ -22,6 +22,8 @@
 #include "task.h"
 #include "main.h"
 #include "cmsis_os.h"
+#include "task_control.h"
+#include "task_communication.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -55,12 +57,20 @@ const osThreadAttr_t defaultTask_attributes = {
   .priority = (osPriority_t) osPriorityNormal,
 };
 
+osThreadId_t gimbalUpdateTaskHandle;
+const osThreadAttr_t gimbalUpdateTask_attributes = {
+  .name = "gimbalUpdate",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
+void gimbal_update(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -89,6 +99,17 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
   /* USER CODE END RTOS_QUEUES */
+
+  if (Task_Control_Create() != pdPASS ||
+      Task_Communication_Create() != pdPASS) {
+    Error_Handler();
+  }
+
+  gimbalUpdateTaskHandle = osThreadNew(gimbal_update, NULL,
+                                       &gimbalUpdateTask_attributes);
+  if (gimbalUpdateTaskHandle == NULL) {
+    Error_Handler();
+  }
 
   /* Create the thread(s) */
   /* creation of defaultTask */
@@ -120,6 +141,16 @@ void StartDefaultTask(void *argument)
     osDelay(1);
   }
   /* USER CODE END StartDefaultTask */
+}
+
+void gimbal_update(void *argument)
+{
+  (void)argument;
+  for(;;)
+  {
+    Task_Control_GimbalUpdate();
+    osDelay(5);
+  }
 }
 
 /* Private application code --------------------------------------------------*/
