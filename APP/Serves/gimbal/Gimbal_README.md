@@ -19,8 +19,8 @@
 
 | 轴 | PWM 通道 | 舵机机械角 | 云台软件角 |
 |---|---|---:|---:|
-| Yaw | TIM1_CH3，PE13 | 0°~180° | -90°~90° |
-| Pitch | TIM1_CH4，PE14 | 0°~180° | -90°~90° |
+| Yaw | TIM1_CH4，PE14 | 0°~180° | -90°~90° |
+| Pitch | TIM1_CH3，PE13 | 0°~180° | -90°~90° |
 
 - 舵机机械角 90° 对应云台软件角 0°；
 - 纸面中心为 `(0,0)`；
@@ -37,9 +37,9 @@
 1. HAL 和系统时钟初始化；
 2. GPIO、TIM1 等外设初始化；
 3. 调用 `Gimbal_Init()`；
-4. 主循环或 RTOS 周期任务中持续调用 `Gimbal_Update()`。
+4. 在裸机主循环中按固定 5~10 ms 周期持续调用 `Gimbal_Update()`。
 
-`Gimbal_Init()` 内部会调用 `Servo_Init()`，因此应用层不需要再次单独启动两个 PWM 通道。初始化完成后两个舵机位于机械角 90°，云台软件角均记录为 0°。
+`Gimbal_Init()` 内部会调用 `Servo_Init()`，因此应用层不需要再次单独启动两个 PWM 通道。初始化完成后两个舵机的逻辑角为 90°，Servo 层自动叠加 Yaw -3°、Pitch +5° 的机械零位补偿，云台软件角均记录为 0°。
 
 ### 裸机示例
 
@@ -64,21 +64,6 @@ int main(void)
 }
 ```
 
-### RTOS 示例
-
-```c
-void GimbalTask(void *argument)
-{
-    if (Gimbal_Init() != GIMBAL_STATUS_OK) {
-        Error_Handler();
-    }
-
-    for (;;) {
-        Gimbal_Update();
-        osDelay(10);
-    }
-}
-```
 
 > 不要用一个很长的 `HAL_Delay()` 代替周期更新。运动过程中每次双轴指令变化不超过 2°，滤波和分段运动都依赖持续调用 `Gimbal_Update()`。
 
@@ -99,6 +84,45 @@ Gimbal_SetRelative(10.0f, 10.0f);
 ```
 
 表示以当前软件位置为基准，两轴各增加 10°。函数不会阻塞；调用后仍必须继续运行 `Gimbal_Update()`。
+#### 串口三参数单轴相对运动
+
+新增接口：
+
+```c
+Gimbal_Status_t Gimbal_SetRelativeByAxis(uint8_t axis,
+                                         uint8_t direction,
+                                         float angle_deg);
+```
+
+三个参数分别为轴、方向和角度绝对值：
+
+- `axis`：`'Y'` 控制 Yaw，`'P'` 控制 Pitch；
+- `direction`：二进制 `0x00` 为负方向，二进制 `0x01` 为正方向；
+- `angle_deg`：角度绝对值，单位为度。
+
+USART1 三字节接收完成后可以直接调用：
+
+```c
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        (void)Gimbal_SetRelativeByAxis(mess[0],
+                                       mess[1],
+                                       (float)mess[2]);
+        HAL_UART_Receive_IT(&huart1, mess, 3U);
+    }
+}
+```
+
+例如以 HEX 方式发送：
+
+- `50 00 05`：Pitch -5°；
+- `50 01 05`：Pitch +5°；
+- `59 00 0A`：Yaw -10°；
+- `59 01 0A`：Yaw +10°。
+
+注意方向字节是原始二进制 `00/01`，因此不能写成 `mess[1] == '0'`。字符 `'0'` 的数值是 `0x30`，与二进制 `0x00` 不相等。
 
 如果要等待一次运动完成后再发送下一条相对命令，可使用：
 
@@ -283,14 +307,14 @@ void App_OnVisionSpot(float x_cm, float y_cm)
     (void)Gimbal_SubmitVisionSpot(x_cm, y_cm);
 }
 
-/* 由主循环或 RTOS 任务固定周期调用。 */
-void App_10msTask(void)
+/* 由裸机主循环固定周期调用。 */
+void App_10msUpdate(void)
 {
     Gimbal_Update();
 }
 ```
 
-视觉接口和云台更新接口不要放在长时间阻塞的代码后面。若由不同 RTOS 任务并发调用，应在应用层使用互斥锁或临界区保护；不建议在高优先级中断中执行浮点滤波。
+视觉接口和云台更新接口不要放在长时间阻塞的代码后面。裸机程序中建议在主循环处理视觉数据和浮点滤波；中断只保存原始接收数据并置位，不建议在高优先级中断中执行浮点滤波。
 
 ## 8. 状态读取与立即停止
 

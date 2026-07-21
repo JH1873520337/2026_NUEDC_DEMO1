@@ -2,7 +2,8 @@
  * @file Gimbal.c
  * @brief 二维云台、矩形扫描轨迹以及视觉逐点闭环修正的实现。
  *
- * 软件角定义：舵机 90° 为云台 0°；Yaw/Pitch 均限制在 -90°~90°。
+ * 软件角定义：舵机逻辑 90° 为云台 0°；实际 PWM 由 Servo 层叠加机械零位补偿。
+ * Yaw/Pitch 软件角均限制在 -90°~90°。
  * 运动由 Gimbal_Update() 非阻塞推进，每次给两个舵机下发的角度增量均不超过 2°。
  * 矩形轨迹每边划分为 10 段（11 个端点），整周共 40 段。每到达一个理论点后，
  * 状态机会尝试消费一帧不超过 150 ms 的视觉光斑坐标，完成至多一次增量修正，
@@ -130,8 +131,8 @@ static float Gimbal_QuantizeAngle(float angle_deg)
 
 
 /**
- * @brief 从舵机驱动读取当前 PWM 软件角，并转换成以 90° 为零点的云台角。
- * @note 该值是软件输出角，不是编码器反馈得到的真实机械角。
+ * @brief 从舵机驱动读取逻辑 PWM 软件角，并转换成以逻辑 90° 为零点的云台角。
+ * @note Servo 层零位补偿不进入软件角状态；该值仍不是编码器反馈的真实机械角。
  */
 static void Gimbal_SyncCurrentFromServo(void)
 {
@@ -602,7 +603,12 @@ static void Gimbal_HandleTargetArrival(void)
     Gimbal_AdvanceRectangleAfterTarget();
 }
 
-/** 初始化舵机、云台状态、矩形状态和视觉滤波状态；初始化后双轴软件角为 0°。 */
+/**
+ * @brief 初始化舵机、云台状态、矩形状态和视觉滤波状态。
+ * @details Servo_Init() 使用 Yaw=-6°、Pitch=-2° 的最终 PWM 零位补偿，
+ *          直接输出实机复测得到的正确机械复位位置；补偿不进入云台软件坐标，
+ *          因此本函数返回后 current/target/command 的 Yaw、Pitch 均为 0°。
+ */
 Gimbal_Status_t Gimbal_Init(void)
 {
 
@@ -701,6 +707,48 @@ Gimbal_Status_t Gimbal_SetRelative(float delta_yaw_deg,
     return GIMBAL_STATUS_OK;
 }
 
+/**
+ * @brief 根据串口帧常用的“轴、方向、角度”三个字段启动单轴相对运动。
+ *
+ * @details
+ * - axis='Y' 时仅改变 Yaw，axis='P' 时仅改变 Pitch；
+ * - direction=0 时角度取负，direction=1 时角度取正；
+ * - direction 必须是二进制 0x00/0x01，不能传 ASCII 字符 '0'(0x30)/'1'(0x31)；
+ * - angle_deg 是角度绝对值，单位为度，本函数内部负责添加正负号；
+ * - 最终调用 Gimbal_SetRelative()，因此仍保留 ±90° 限位和每步不超过 2° 的运动规则。
+ */
+Gimbal_Status_t Gimbal_SetRelativeByAxis(uint8_t axis,
+                                         uint8_t direction,
+                                         float angle_deg)
+{
+    float signed_angle_deg;
+
+    /* 角度参数表示绝对值，不允许调用者同时通过负角度和方向重复指定符号。 */
+    if ((Gimbal_IsFinite(angle_deg) == 0U) || (angle_deg < 0.0f)) {
+        return GIMBAL_STATUS_INVALID_ARGUMENT;
+    }
+
+    /* 串口方向字段约定为原始二进制 0x00/0x01。 */
+    if ((direction != GIMBAL_DIRECTION_NEGATIVE) &&
+        (direction != GIMBAL_DIRECTION_POSITIVE)) {
+        return GIMBAL_STATUS_INVALID_ARGUMENT;
+    }
+
+    if ((axis != GIMBAL_AXIS_YAW) && (axis != GIMBAL_AXIS_PITCH)) {
+        return GIMBAL_STATUS_INVALID_ARGUMENT;
+    }
+
+    signed_angle_deg = angle_deg;
+    if (direction == GIMBAL_DIRECTION_NEGATIVE) {
+        signed_angle_deg = -signed_angle_deg;
+    }
+
+    if (axis == GIMBAL_AXIS_YAW) {
+        return Gimbal_SetRelative(signed_angle_deg, 0.0f);
+    }
+
+    return Gimbal_SetRelative(0.0f, signed_angle_deg);
+}
 /**
  * @brief 沿输入向量 (X,Y) 的方向持续运动，直到任意一轴先到达 ±90°。
  * @details 对向量按最大分量归一化，保持 Yaw 与 Pitch 运动比例不变。

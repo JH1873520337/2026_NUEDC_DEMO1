@@ -26,7 +26,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "Gimbal.h"
+#include "GimbalDebug.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,7 +48,15 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+uint8_t mess[3];
+float l;
+static const Gimbal_Point2D_t rectangle_50cm[4] =
+{
+  {-25.0f,  25.0f},   /* 左上角：轨迹起点 */
+  { 25.0f,  25.0f},   /* 右上角 */
+  { 25.0f, -25.0f},   /* 右下角 */
+  {-25.0f, -25.0f}    /* 左下角 */
+};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -60,6 +69,25 @@ void MX_FREERTOS_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+  if (huart->Instance == USART1)
+  {
+    /* 原样回显收到的三个二进制字节。 */
+    HAL_UART_Transmit(huart, mess, 3U, 100U);
+
+    /*
+     * mess[0]：'Y' 或 'P'
+     * mess[1]：二进制 0x00 或 0x01
+     * mess[2]：角度绝对值，单位为度
+     */
+    (void)Gimbal_SetRelativeByAxis(mess[0],
+                                   mess[1],
+                                   (float)mess[2]);
+
+    /* 接收处理完成后，重新开启下一帧三字节中断接收。 */
+    HAL_UART_Receive_IT(&huart1, mess, 3U);
+  }
+}
 /* USER CODE END 0 */
 
 /**
@@ -95,9 +123,23 @@ int main(void)
   MX_TIM1_Init();
   MX_UART4_Init();
   MX_UART5_Init();
+  MX_TIM2_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+
+  if (Gimbal_Init() != GIMBAL_STATUS_OK)
+  {
+    Error_Handler();
+  }
+
+  HAL_UART_Receive_IT(&huart1, mess, 3U);
+
+
+  while (1) {
+    Gimbal_Update();
+
+  }
+
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -116,6 +158,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* GimbalDebug_Update() 内部已经调用 Gimbal_Update()，不要重复调用。 */
+
   }
   /* USER CODE END 3 */
 }
@@ -166,7 +210,7 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+/* USART1 采用 GimbalDebug_USART1_IRQHandler() 直接处理 RXNE，不再使用 HAL 接收回调。 */
 /* USER CODE END 4 */
 
 /**

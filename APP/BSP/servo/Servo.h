@@ -3,8 +3,8 @@
  * @brief DS3115 双舵机 PWM 驱动公共接口。
  *
  * 硬件固定映射：
- * - 舵机 1 / Yaw：TIM1_CH3，PE13；
- * - 舵机 2 / Pitch：TIM1_CH4，PE14。
+ * - Yaw 轴：TIM1_CH4，PE14；
+ * - Pitch 轴：TIM1_CH3，PE13。
  *
  * 定时器参数为 PSC=179、ARR=17999，TIM1 输入时钟为 162 MHz，
  * 因而计数频率为 900 kHz、PWM 周期为 20 ms（50 Hz）。
@@ -25,6 +25,14 @@ extern "C" {
 /** 本驱动管理的舵机数量。 */
 #define SERVO_COUNT                         2U
 
+/**
+ * 逻辑轴到实际 PWM 通道的唯一映射点。
+ * 当前硬件已经对调：Yaw 接 TIM1_CH4，Pitch 接 TIM1_CH3。
+ * 上层仍只使用 SERVO_YAW/SERVO_PITCH，不需要交换参数或修改坐标算法。
+ */
+#define SERVO_YAW_PWM_CHANNEL               TIM_CHANNEL_4
+#define SERVO_PITCH_PWM_CHANNEL             TIM_CHANNEL_3
+
 /** DS3115 允许的软件机械角范围及中心位置。 */
 #define SERVO_MIN_ANGLE_DEG                 0.0f
 #define SERVO_MAX_ANGLE_DEG                 180.0f
@@ -36,7 +44,17 @@ extern "C" {
  * 因此 Gimbal 模块仍可统一使用正常的数学正方向。当前实际安装要求两轴均反向。
  */
 #define SERVO_YAW_REVERSED                   1U
-#define SERVO_PITCH_REVERSED                 1U
+#define SERVO_PITCH_REVERSED                 0U
+
+/**
+ * 机械零位校准（2026-07-21 实机复测）：在旧补偿下，云台软件角必须运动到
+ * Yaw=-3°、Pitch=-7° 时装置才正确对正。为使 Gimbal_Init() 调用后直接到达同一物理位置，
+ * 将这两个软件偏移并入最终 PWM 零位补偿：Yaw -3° + (-3°) = -6°，
+ * Pitch +5° + (-7°) = -2°。补偿只改变实际 CCR，不改变上层逻辑角，
+ * 因此初始化和以后回到软件零点时仍报告 Yaw=0°、Pitch=0°。
+ */
+#define SERVO_YAW_ZERO_TRIM_DEG              (-2.0f)
+#define SERVO_PITCH_ZERO_TRIM_DEG            (4.0f)
 
 /**
  * 软件角度分辨率为 0.1°。
@@ -70,8 +88,8 @@ extern "C" {
 /** 舵机逻辑编号，同时定义其在云台中的用途。 */
 typedef enum
 {
-    SERVO_YAW = 0,   /**< 舵机 1：TIM1_CH3，负责 Yaw 轴。 */
-    SERVO_PITCH,     /**< 舵机 2：TIM1_CH4，负责 Pitch 轴。 */
+    SERVO_YAW = 0,   /**< 逻辑 Yaw：实际输出到 TIM1_CH4/PE14。 */
+    SERVO_PITCH,     /**< 逻辑 Pitch：实际输出到 TIM1_CH3/PE13。 */
 } Servo_Id_t;
 
 /** 单个舵机的只读硬件配置。 */
@@ -99,7 +117,7 @@ typedef struct
 } Servo_State_t;
 
 /**
- * @brief 初始化两个 PWM 通道，并将两个舵机立即置于 90°。
+ * @brief 初始化两个 PWM 通道，并将逻辑角置于 90°，输出时自动叠加机械零位补偿。
  * @return HAL_OK 表示成功；HAL_ERROR 表示定时器或 PWM 通道启动失败。
  * @note 调用前必须已经执行 MX_TIM1_Init()。
  */
@@ -118,7 +136,7 @@ HAL_StatusTypeDef Servo_SetAngles(float yaw_angle_deg, float pitch_angle_deg);
 
 /**
  * @brief 执行一次两通道滤波和 PWM 更新。
- * @note 推荐由固定 10 ms 周期任务调用，不应在中断中执行。
+ * @note 推荐由裸机主循环按固定 5~10 ms 周期调用，不应在中断中执行。
  */
 void Servo_Update(void);
 

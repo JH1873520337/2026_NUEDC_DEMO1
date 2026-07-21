@@ -8,6 +8,7 @@
  *      -> 一阶低通滤波
  *      -> 一维卡尔曼滤波
  *      -> 0.1° 再量化
+ *      -> 机械零位补偿与安装方向反转
  *      -> TIM1 CCR3/CCR4
  *
  * 注意：滤波对象是“角度控制指令”，不是传感器反馈。current_angle_deg
@@ -29,10 +30,13 @@
  * 当前参数得到：500 us -> 450，2500 us -> 2250。
  */
 static const Servo_Config_t g_servo_config[SERVO_COUNT] = {
-    {&htim1, TIM_CHANNEL_3,
+    /* SERVO_YAW 的状态、滤波器、反向和零位补偿只驱动实际 Yaw 通道 CH4。 */
+    {&htim1, SERVO_YAW_PWM_CHANNEL,
      (SERVO_MIN_PULSE_US * SERVO_TIMER_COUNTER_HZ + 500000UL) / 1000000UL,
      (SERVO_MAX_PULSE_US * SERVO_TIMER_COUNTER_HZ + 500000UL) / 1000000UL},
-    {&htim1, TIM_CHANNEL_4,
+
+    /* SERVO_PITCH 的状态、滤波器、反向和零位补偿只驱动实际 Pitch 通道 CH3。 */
+    {&htim1, SERVO_PITCH_PWM_CHANNEL,
      (SERVO_MIN_PULSE_US * SERVO_TIMER_COUNTER_HZ + 500000UL) / 1000000UL,
      (SERVO_MAX_PULSE_US * SERVO_TIMER_COUNTER_HZ + 500000UL) / 1000000UL},
 };
@@ -111,8 +115,17 @@ static uint32_t Servo_AngleToCompare(Servo_Id_t servo_id, float angle_deg)
     const Servo_Config_t *config = &g_servo_config[servo_id];
     uint32_t angle_tenths;
     uint32_t compare_range;
+    float zero_trim_deg;
 
-    angle_deg = Servo_QuantizeAngle(angle_deg);
+    /*
+     * 零位补偿必须放在逻辑角状态之外：上层仍把 90° 当作云台 0°，这里只在
+     * 写 CCR 前修正实际脉宽。当前实机复测后的最终补偿为 Yaw -6°、Pitch -2°，
+     * 使逻辑中心 90°对应正确机械零位，同时上层软件角仍保持 0°。
+     */
+    zero_trim_deg = (servo_id == SERVO_YAW)
+                        ? SERVO_YAW_ZERO_TRIM_DEG
+                        : SERVO_PITCH_ZERO_TRIM_DEG;
+    angle_deg = Servo_QuantizeAngle(angle_deg + zero_trim_deg);
 
     /*
      * 根据实际安装方向在最终 PWM 映射处镜像角度：0°<->180°，90°保持不变。

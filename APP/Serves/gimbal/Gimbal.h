@@ -22,6 +22,14 @@ extern "C" {
 #define GIMBAL_MAX_STEP_DEG                  (2.0f)
 #define GIMBAL_ARRIVAL_TOLERANCE             (0.05f)
 
+/** 单轴三参数相对运动接口使用的轴标识，与串口协议首字节一致。 */
+#define GIMBAL_AXIS_YAW                      ((uint8_t)'Y')
+#define GIMBAL_AXIS_PITCH                    ((uint8_t)'P')
+
+/** 单轴三参数相对运动接口使用的方向值。注意这里是二进制 0/1，不是字符 '0'/'1'。 */
+#define GIMBAL_DIRECTION_NEGATIVE            (0U)
+#define GIMBAL_DIRECTION_POSITIVE            (1U)
+
 /** 每边 11 个点，即每边 10 段、整周 40 段。 */
 #define GIMBAL_RECT_VERTEX_COUNT             4U
 #define GIMBAL_RECT_EDGE_COUNT               4U
@@ -42,7 +50,7 @@ extern "C" {
 #define GIMBAL_VISION_KALMAN_INITIAL_COV     (1.0f)
 
 /** 20 Hz 数据周期为 50 ms；超过 150 ms 未更新即视为当前点“无视觉数据”。 */
-#define GIMBAL_VISION_DATA_TIMEOUT_MS        150U
+#define GIMBAL_VISION_DATA_TIMEOUT_MS        400U
 
 /** 光斑误差不超过该值时不再产生额外修正动作，单位 cm。 */
 #define GIMBAL_VISION_CORRECTION_TOLERANCE_CM (0.30f)
@@ -136,6 +144,19 @@ Gimbal_Status_t Gimbal_Init(void);
 Gimbal_Status_t Gimbal_SetAbsolute(float yaw_deg, float pitch_deg);
 Gimbal_Status_t Gimbal_SetRelative(float delta_yaw_deg,
                                    float delta_pitch_deg);
+
+/**
+ * @brief 使用“轴、方向、角度”三个参数启动单轴相对运动。
+ * @param axis        GIMBAL_AXIS_YAW/'Y' 或 GIMBAL_AXIS_PITCH/'P'。
+ * @param direction   GIMBAL_DIRECTION_NEGATIVE/0 表示负向，
+ *                    GIMBAL_DIRECTION_POSITIVE/1 表示正向；必须传二进制数值。
+ * @param angle_deg   相对运动角度的绝对值，单位为度，必须大于等于 0。
+ * @retval GIMBAL_STATUS_OK 命令已接受；其他值表示参数错误或云台尚未初始化。
+ * @note 本函数是非阻塞接口，调用后仍需在裸机主循环中周期执行 Gimbal_Update()。
+ */
+Gimbal_Status_t Gimbal_SetRelativeByAxis(uint8_t axis,
+                                         uint8_t direction,
+                                         float angle_deg);
 Gimbal_Status_t Gimbal_SetVector(float x, float y);
 
 /** 将纸面坐标换算成先 Yaw 后 Pitch 的云台软件角。 */
@@ -145,7 +166,7 @@ Gimbal_Status_t Gimbal_PointToAngles(const Gimbal_Point2D_t *point,
                                      float *pitch_deg);
 
 /**
- * 输入一帧视觉检测到的激光光斑坐标，建议由视觉接收任务按约 20 Hz 调用。
+ * 输入一帧视觉检测到的激光光斑坐标，建议由裸机视觉接收/解析流程按约 20 Hz 调用。
  * 调用本函数代表“本帧有有效数据”；没有识别到光斑时不要调用。函数内部
  * 对 X/Y 分别进行一阶低通和卡尔曼滤波，并保存最新时间戳。
  */

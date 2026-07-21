@@ -48,6 +48,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     APP/Algorithm/KalmanFilter.c
     APP/BSP/servo/Servo.c
     APP/Serves/gimbal/Gimbal.c
+    APP/Serves/gimbal/GimbalDebug.c
 )
 
 # Add include paths
